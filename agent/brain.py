@@ -21,10 +21,11 @@ import time
 import logging
 import threading
 from pathlib import Path
+import sqlite3
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, HAIKU_MODEL, LANGGRAPH_RECURSION_LIMIT
 from agent.prompts import SYSTEM_PROMPT
@@ -51,21 +52,48 @@ AGENT_TOOLS = [
 
 
 def _trim_state(state: dict) -> list:
-    """Keep last 20 messages, always starting from a HumanMessage.
+    """Keep last 20 messages, ensuring no orphaned tool_result blocks.
 
     Naive tail-slicing can leave orphaned tool_result blocks at the start
     (when the corresponding tool_use was cut off), which causes Anthropic to
-    return a 400 error.  We scan forward after trimming to find the first
-    HumanMessage so the history is always structurally valid.
+    return a 400 error.
+
+    Strategy:
+    1. Trim to last 20 messages.
+    2. Collect all tool_use_ids present in the trimmed window.
+    3. Walk forward, skipping any ToolMessage whose tool_call_id is not in
+       the collected set (these are orphaned results from cut-off tool calls).
+    4. Additionally, ensure the slice starts from a HumanMessage.
     """
+    from langchain_core.messages import ToolMessage, AIMessage
+
     messages = state.get("messages", [])
     if len(messages) <= 20:
         return messages
     trimmed = messages[-20:]
-    for i, msg in enumerate(trimmed):
+
+    # Collect all tool_use ids that are present in this window
+    present_ids: set[str] = set()
+    for msg in trimmed:
+        if isinstance(msg, AIMessage):
+            for block in (msg.tool_calls or []):
+                if block.get("id"):
+                    present_ids.add(block["id"])
+
+    # Remove orphaned ToolMessages (tool_result without matching tool_use)
+    cleaned = [
+        msg for msg in trimmed
+        if not (isinstance(msg, ToolMessage) and msg.tool_call_id not in present_ids)
+    ]
+
+    # Find first HumanMessage to avoid starting mid-conversation
+    for i, msg in enumerate(cleaned):
         if isinstance(msg, HumanMessage):
-            return trimmed[i:]
-    return trimmed  # fallback: no HumanMessage found, return as-is
+            return cleaned[i:]
+    return cleaned  # fallback: no HumanMessage found
+
+
+_DB_PATH = str(Path(__file__).parent / "memory.db")
 
 
 def get_agent():
@@ -82,13 +110,15 @@ def get_agent():
             temperature=0,
             max_tokens=4096,
         )
+        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
         _agent = create_react_agent(
             llm,
             AGENT_TOOLS,
-            checkpointer=MemorySaver(),
+            checkpointer=checkpointer,
             prompt=_trim_state,
         )
-        logger.info("[brain] agent ready: %s", HAIKU_MODEL)
+        logger.info("[brain] agent ready: %s  (memory: %s)", HAIKU_MODEL, _DB_PATH)
         return _agent
 
 
