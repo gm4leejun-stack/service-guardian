@@ -26,6 +26,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.errors import GraphRecursionError
 
 from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, HAIKU_MODEL, LANGGRAPH_RECURSION_LIMIT
 from agent.prompts import SYSTEM_PROMPT
@@ -247,6 +248,18 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         )
         return _extract_last_ai_message(result)
 
+    except GraphRecursionError as e:
+        # LangGraph hit its step limit — route directly to Tier-2 self-heal
+        # (not transient, not history corruption — agent needs to raise its own limit)
+        logger.warning("[brain] GraphRecursionError in thread %s: %s", thread_id, e)
+        threading.Thread(
+            target=_run_self_heal,
+            args=(e, task[:300], chat_id),
+            daemon=True,
+            name="self-heal",
+        ).start()
+        return "❌ 步骤数超限，已启动 Claude Code 自动修复（将提升递归限制并重启服务）"
+
     except Exception as e:
         if _is_history_corruption(e):
             # Tier-1 self-heal: history corruption → retry with fresh thread (sync)
@@ -261,7 +274,6 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
                 )
                 return _extract_last_ai_message(result)
             except Exception as e2:
-                # Fall through to Tier-2 self-heal
                 e = e2
 
         if not _is_transient_error(e):
