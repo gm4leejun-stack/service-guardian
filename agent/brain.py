@@ -6,14 +6,21 @@ Design:
 - chat_id passed via config["configurable"]["chat_id"] — no closures, no rebuilds
 - Conversation history trimmed to last 20 messages, always starting from a
   HumanMessage to avoid orphaned tool_result blocks (Anthropic 400 error)
-- Self-healing: on message-history corruption, auto-clear thread and retry once
+- Self-healing:
+    * History corruption (400 tool_use_id) → clear thread + retry once (sync)
+    * Any code-level error → spawn background thread that calls Claude Code
+      to fix the ai-supervisor codebase, then restarts the service
+    * Transient errors (network/API/timeout) → no self-heal, just report
+    * 30-minute cooldown prevents self-heal loops
 - notify_user reads chat_id from RunnableConfig automatically
 """
 from __future__ import annotations
 
+import subprocess
 import time
 import logging
 import threading
+from pathlib import Path
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -85,6 +92,95 @@ def get_agent():
         return _agent
 
 
+_SUPERVISOR_DIR = str(Path(__file__).parent.parent)
+_CLAUDE_BIN = str(Path.home() / ".local/bin/claude")
+
+_self_heal_lock = threading.Lock()
+_last_self_heal: float = 0
+SELF_HEAL_COOLDOWN = 1800  # 30 minutes — prevents fix loops
+
+
+def _is_transient_error(err: Exception) -> bool:
+    """Network/API errors that Claude Code can't fix by editing source code."""
+    s = str(err).lower()
+    return any(k in s for k in [
+        "timeout", "timed out", "connection", "network",
+        "rate limit", "quota", "overloaded",
+        "502", "503", "504",
+    ])
+
+
+def _notify(message: str, chat_id: int | None) -> None:
+    if not chat_id:
+        return
+    try:
+        from tools.notify_tools import send_sync
+        send_sync(message, chat_id)
+    except Exception:
+        pass
+
+
+def _run_self_heal(error: Exception, task_context: str, chat_id: int | None) -> None:
+    """Background thread: call Claude Code to fix ai-supervisor, then restart."""
+    global _last_self_heal
+
+    with _self_heal_lock:
+        now = time.time()
+        remaining = SELF_HEAL_COOLDOWN - (now - _last_self_heal)
+        if remaining > 0:
+            logger.info("[brain] Self-heal cooldown active (%ds remaining)", int(remaining))
+            return
+        _last_self_heal = now
+
+    error_str = str(error)
+    logger.warning("[brain] Self-heal triggered: %s", error_str[:200])
+
+    _notify(
+        f"🔧 检测到系统错误，正在调用 Claude Code 自动修复...\n"
+        f"错误：{error_str[:150]}",
+        chat_id,
+    )
+
+    heal_task = (
+        f"AI Supervisor 系统在执行任务时遇到以下错误，请分析原因并修复代码：\n\n"
+        f"错误信息：{error_str}\n\n"
+        f"任务上下文：{task_context}\n\n"
+        f"项目目录：{_SUPERVISOR_DIR}\n\n"
+        f"请：1) 找出导致此错误的源码位置  2) 修复 bug  3) 简要说明改了什么"
+    )
+
+    try:
+        r = subprocess.run(
+            [_CLAUDE_BIN, "--print", "--dangerously-skip-permissions"],
+            input=heal_task, capture_output=True, text=True,
+            timeout=300, cwd=_SUPERVISOR_DIR,
+        )
+        fix_result = (r.stdout.strip() or r.stderr.strip() or "(无输出)")[:400]
+        success = r.returncode == 0
+        logger.info("[brain] Self-heal result (rc=%d): %s", r.returncode, fix_result[:200])
+
+        _notify(
+            f"{'✅' if success else '⚠️'} Claude Code 修复{'完成' if success else '尝试结束'}，正在重启服务...\n"
+            f"{fix_result}",
+            chat_id,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("[brain] Self-heal timed out")
+        _notify("⚠️ Claude Code 修复超时，正在重启服务...", chat_id)
+    except Exception as e:
+        logger.exception("[brain] Self-heal Claude Code call failed: %s", e)
+        _notify(f"⚠️ 自动修复失败（{e}），正在重启服务...", chat_id)
+
+    # Restart service to pick up any code changes
+    try:
+        subprocess.run(["launchctl", "stop", "com.ai-supervisor"], capture_output=True, timeout=5)
+        time.sleep(1)
+        subprocess.run(["launchctl", "start", "com.ai-supervisor"], capture_output=True, timeout=5)
+        logger.info("[brain] Service restarted after self-heal")
+    except Exception as e:
+        logger.error("[brain] Service restart after self-heal failed: %s", e)
+
+
 def _extract_last_ai_message(result: dict) -> str:
     for msg in reversed(result.get("messages", [])):
         role = getattr(msg, "type", None) or getattr(msg, "role", None)
@@ -123,19 +219,11 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
 
     except Exception as e:
         if _is_history_corruption(e):
-            # Self-healing: history corruption — retry with a fresh thread
+            # Tier-1 self-heal: history corruption → retry with fresh thread (sync)
             fresh_tid = f"{thread_id}_fresh_{int(time.time())}"
-            logger.warning(
-                "[brain] History corruption in thread %s — retrying with fresh thread %s",
-                thread_id, fresh_tid,
-            )
-            # Notify user so they know what happened
-            try:
-                from tools.notify_tools import send_sync
-                if chat_id:
-                    send_sync("⚠️ 检测到对话历史异常，正在自动修复并重试...", chat_id)
-            except Exception:
-                pass
+            logger.warning("[brain] History corruption in thread %s → fresh thread %s",
+                           thread_id, fresh_tid)
+            _notify("⚠️ 检测到对话历史异常，正在自动修复并重试...", chat_id)
             try:
                 result = agent.invoke(
                     {"messages": [{"role": "user", "content": task}]},
@@ -143,10 +231,20 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
                 )
                 return _extract_last_ai_message(result)
             except Exception as e2:
-                logger.exception("[brain] Retry after self-heal also failed: %s", e2)
-                return f"❌ 自愈重试失败: {e2}"
+                # Fall through to Tier-2 self-heal
+                e = e2
 
-        logger.exception("[brain] error: %s", e)
+        if not _is_transient_error(e):
+            # Tier-2 self-heal: code bug → Claude Code fixes the codebase, then restart
+            threading.Thread(
+                target=_run_self_heal,
+                args=(e, task[:300], chat_id),
+                daemon=True,
+                name="self-heal",
+            ).start()
+            return f"❌ 执行出错，已启动 Claude Code 自动修复，稍后服务将重启：{e}"
+
+        logger.exception("[brain] transient error: %s", e)
         return f"❌ Agent 执行错误: {e}"
 
 
