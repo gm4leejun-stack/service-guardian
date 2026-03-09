@@ -1,48 +1,37 @@
 """
-log_tools.py — LangGraph tools for reading log files.
-
-Design: tools handle execution, LLM handles intent mapping.
-- Known services are resolved by alias (flexible input)
-- Unknown services: pass log_path directly, or LLM uses run_shell_command
+log_tools.py — read and search log files.
 """
 from __future__ import annotations
 
-import logging
 import subprocess
+import logging
+from datetime import datetime, date
 from pathlib import Path
 from langchain_core.tools import tool
-from workers.log_worker import (
-    get_openclaw_logs,
-    get_openclaw_errors,
-    get_tmp_logs,
-    get_supervisor_log,
-    search_logs,
-    get_log_summary,
-)
 
 logger = logging.getLogger(__name__)
 
-# Known service → log path mapping
+HOME = Path.home()
+
 _SERVICE_LOGS = {
-    "openclaw": str(Path.home() / ".openclaw/logs/gateway.log"),
-    "nanoclaw":  str(Path.home() / "nanoclaw/logs/nanoclaw.log"),
+    "openclaw":        str(HOME / ".openclaw/logs/gateway.log"),
+    "openclaw_errors": str(HOME / ".openclaw/logs/gateway.err.log"),
+    "nanoclaw":        str(HOME / "nanoclaw/logs/nanoclaw.log"),
 }
+_TMP_LOG_DIR  = "/tmp/openclaw"
+_SUPERVISOR_LOG = str(Path(__file__).parent.parent / "logs" / "supervisor.log")
 
-# Alias normalization: accepts abbreviations / mixed case
 _ALIASES = {
-    "nano":      "nanoclaw",
-    "claw":      "openclaw",
-    "gateway":   "openclaw",
-    "openclaw_errors": "openclaw_errors",
-    "errors":    "openclaw_errors",
-    "tmp":       "tmp",
-    "supervisor": "supervisor",
-    "summary":   "summary",
+    "nano":    "nanoclaw",
+    "claw":    "openclaw",
+    "gateway": "openclaw",
+    "errors":  "openclaw_errors",
 }
 
+MAX_CHARS = 3500
 
-def _resolve_service(name: str) -> str:
-    """Normalize service name. Tries alias table, then exact match."""
+
+def _resolve(name: str) -> str:
     n = name.strip().lower()
     return _ALIASES.get(n, n)
 
@@ -50,7 +39,7 @@ def _resolve_service(name: str) -> str:
 def _tail(path: str, n: int) -> str:
     p = Path(path)
     if not p.exists():
-        return f"(日志文件不存在: {path})"
+        return f"(日志不存在: {path})"
     try:
         r = subprocess.run(["tail", f"-{n}", path], capture_output=True, text=True, timeout=10)
         return r.stdout.strip() or "(空)"
@@ -58,54 +47,71 @@ def _tail(path: str, n: int) -> str:
         return f"读取失败: {e}"
 
 
+def _grep(keyword: str, path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"(文件不存在: {path})"
+    try:
+        r = subprocess.run(["grep", "-n", "-i", keyword, path],
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.strip().splitlines()[-20:]
+        return "\n".join(lines) if lines else f"未找到 '{keyword}'"
+    except Exception as e:
+        return f"搜索失败: {e}"
+
+
 @tool
-def read_logs(service: str, lines: int = 50, level: str = "all") -> str:
+def read_logs(service: str, lines: int = 30, level: str = "all") -> str:
     """
     读取服务日志。
 
     Args:
-        service: 服务名或日志文件绝对路径。
-                 已知服务（支持缩写）：nanoclaw（或 nano）、openclaw（或 gateway/claw）、
-                 openclaw_errors（或 errors）、tmp、supervisor、summary。
-                 未知服务：直接传日志文件的绝对路径，例如 /var/log/myapp/app.log
-        lines: 读取行数，默认50
-        level: 日志级别过滤：all（默认）、error、warn
-
-    Returns:
-        日志内容
+        service: 服务名（支持缩写）或日志文件绝对路径。
+                 已知服务：nanoclaw（nano）、openclaw（claw/gateway）、
+                 openclaw_errors（errors）、tmp、supervisor、summary
+        lines: 读取行数，默认30
+        level: all（默认）、error、warn
     """
-    svc = _resolve_service(service)
+    svc = _resolve(service)
 
-    # Known named services
-    if svc == "nanoclaw":
-        content = _tail(_SERVICE_LOGS["nanoclaw"], lines)
-    elif svc == "openclaw":
-        content = get_openclaw_logs(lines)
-    elif svc == "openclaw_errors":
-        content = get_openclaw_errors(lines)
+    if svc in _SERVICE_LOGS:
+        content = _tail(_SERVICE_LOGS[svc], lines)
     elif svc == "tmp":
-        content = get_tmp_logs(lines)
+        tmp = Path(_TMP_LOG_DIR)
+        if not tmp.exists():
+            return f"(目录不存在: {_TMP_LOG_DIR})"
+        files = sorted(tmp.glob("*.log"), reverse=True)
+        if not files:
+            return "(无日志文件)"
+        content = f"[{files[0].name}]\n{_tail(str(files[0]), lines)}"
     elif svc == "supervisor":
-        content = get_supervisor_log(lines)
+        content = _tail(_SUPERVISOR_LOG, lines)
     elif svc == "summary":
-        content = get_log_summary()
+        parts = []
+        for name, path in _SERVICE_LOGS.items():
+            p = Path(path)
+            if p.exists():
+                size = p.stat().st_size
+                mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%m-%d %H:%M")
+                parts.append(f"  {name}: {size:,}字节，更新于 {mtime}")
+            else:
+                parts.append(f"  {name}: 不存在")
+        return "日志摘要:\n" + "\n".join(parts)
     elif service.startswith("/") or service.startswith("~"):
-        # Direct file path
         content = _tail(str(Path(service).expanduser()), lines)
     else:
-        return (
-            f"未识别的服务名：'{service}'。\n"
-            f"已知服务：nanoclaw、openclaw、openclaw_errors、tmp、supervisor、summary。\n"
-            f"也可传日志文件绝对路径，或用 run_shell_command 自行查找。"
-        )
+        return (f"未识别服务：'{service}'。已知：nanoclaw、openclaw、openclaw_errors、"
+                f"tmp、supervisor、summary，或传日志文件绝对路径")
 
     if level == "error":
-        filtered = [l for l in content.splitlines() if "error" in l.lower() or "err" in l.lower()]
-        content = "\n".join(filtered) or "(无 error 级别日志)"
+        filtered = [l for l in content.splitlines() if "error" in l.lower()]
+        content = "\n".join(filtered) or "(无 error 日志)"
     elif level == "warn":
         filtered = [l for l in content.splitlines() if "warn" in l.lower() or "error" in l.lower()]
-        content = "\n".join(filtered) or "(无 warn/error 级别日志)"
+        content = "\n".join(filtered) or "(无 warn/error 日志)"
 
+    if len(content) > MAX_CHARS:
+        content = content[-MAX_CHARS:] + "\n...[截断，仅显示最新部分]"
     return content or "(日志为空)"
 
 
@@ -116,33 +122,35 @@ def search_logs_tool(keyword: str, service: str = "all") -> str:
 
     Args:
         keyword: 搜索关键词
-        service: 搜索范围。已知服务（支持缩写）：nanoclaw（或 nano）、openclaw、
-                 errors、tmp、all（默认搜所有已知日志）。
-                 也可传日志文件绝对路径。
-
-    Returns:
-        匹配结果
+        service: nanoclaw（nano）、openclaw（claw）、openclaw_errors（errors）、all（默认）
+                 或日志文件绝对路径
     """
     if not keyword:
-        return "❌ 请提供搜索关键词"
+        return "❌ 请提供关键词"
 
-    svc = _resolve_service(service)
+    svc = _resolve(service)
 
-    # NanoClaw or direct path
-    if svc == "nanoclaw" or service.startswith("/") or service.startswith("~"):
-        path = _SERVICE_LOGS["nanoclaw"] if svc == "nanoclaw" else str(Path(service).expanduser())
-        p = Path(path)
-        if not p.exists():
-            return f"(日志不存在: {path})"
-        try:
-            r = subprocess.run(["grep", "-n", "-i", keyword, str(p)],
-                               capture_output=True, text=True, timeout=10)
-            lines = r.stdout.strip().splitlines()[-20:]
-            return "\n".join(lines) if lines else f"未找到关键词 '{keyword}'"
-        except Exception as e:
-            return f"搜索失败: {e}"
+    if svc in _SERVICE_LOGS:
+        return _grep(keyword, _SERVICE_LOGS[svc])
 
-    # openclaw / errors / tmp / all
-    if svc not in ("openclaw", "openclaw_errors", "errors", "tmp", "all"):
-        svc = "all"
-    return search_logs(keyword, log_source=svc)
+    if service.startswith("/") or service.startswith("~"):
+        return _grep(keyword, str(Path(service).expanduser()))
+
+    # all: search all known logs
+    results = []
+    for name, path in _SERVICE_LOGS.items():
+        r = _grep(keyword, path)
+        if "未找到" not in r and "不存在" not in r:
+            results.append(f"[{name}]\n{r}")
+    output = "\n\n".join(results) if results else f"所有日志中未找到 '{keyword}'"
+    if len(output) > MAX_CHARS:
+        output = output[-MAX_CHARS:]
+    return output
+
+
+# Internal helpers for watchdog/triage (no LangChain wrapper)
+def tail_log(service_key: str, n: int = 30) -> str:
+    path = _SERVICE_LOGS.get(service_key)
+    if not path:
+        return f"(未知服务: {service_key})"
+    return _tail(path, n)

@@ -2,12 +2,19 @@
 watchdog.py — monitors OpenClaw/NanoClaw for real freezes.
 
 Freeze definition (per service):
-  OpenClaw: process running + Telegram has pending updates (messages queued
-            but not processed) + log stale > threshold
+  OpenClaw: process running + log stale > threshold + Telegram has pending
+            updates (messages queued but not processed)
   NanoClaw: process NOT running (crash/stop) — log staleness alone is not
             a reliable signal since NanoClaw may be idle
 
-Quiet hours (0:00-8:00): rescues run silently, no Telegram notifications.
+Smart Triage: when an anomaly signal is detected, one cheap LLM call
+confirms whether it's a real incident before launching the full ReAct
+rescue. This avoids false-alarm rescues at near-zero cost.
+
+Cooldown: each service has a 60-minute cooldown after a rescue fires,
+preventing alert storms on slow-recovering services.
+
+Quiet hours (0:00–8:00): rescues run silently, no Telegram notifications.
 """
 from __future__ import annotations
 
@@ -28,26 +35,33 @@ from config.settings import (
     WATCHDOG_QUIET_HOURS_END,
     OPENCLAW_LOG,
     ADMIN_CHAT_ID,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL,
+    HAIKU_MODEL,
 )
-from workers.openclaw_worker import get_service_status
+from tools.service_tools import get_service_status, restart_service
 
 logger = logging.getLogger(__name__)
 
 # OpenClaw's own Telegram bot token (for pending update check)
 OPENCLAW_BOT_TOKEN = "8397885859:AAHwmhMbyUu8cRcG_vdIkb-PG7TUGMt21xU"
 
+# Per-service rescue cooldown in seconds (60 minutes)
+RESCUE_COOLDOWN = 3600
+_last_rescue: dict[str, float] = {}
+
 SERVICES_TO_WATCH = [
     {
         "key": "openclaw",
         "log": OPENCLAW_LOG,
         "description": "OpenClaw Gateway",
-        "freeze_check": "telegram_pending",  # use Telegram API as signal
+        "freeze_check": "telegram_pending",
     },
     {
         "key": "nanoclaw",
         "log": str(Path.home() / "nanoclaw/logs/nanoclaw.log"),
         "description": "NanoClaw",
-        "freeze_check": "process_down",  # only alert if process is actually down
+        "freeze_check": "process_down",
     },
 ]
 
@@ -60,6 +74,18 @@ def is_quiet_hours() -> bool:
     return h >= start or h < end
 
 
+def _in_cooldown(service_key: str) -> bool:
+    last = _last_rescue.get(service_key)
+    if last is None:
+        return False
+    elapsed = time.time() - last
+    if elapsed < RESCUE_COOLDOWN:
+        logger.info("[watchdog] %s in cooldown (%.0f / %ds remaining)", service_key,
+                    elapsed, RESCUE_COOLDOWN - elapsed)
+        return True
+    return False
+
+
 def _log_age_seconds(log_path: str) -> float | None:
     p = Path(log_path)
     if not p.exists():
@@ -68,10 +94,6 @@ def _log_age_seconds(log_path: str) -> float | None:
 
 
 def _get_telegram_pending(bot_token: str) -> int | None:
-    """
-    Return pending_update_count from Telegram getWebhookInfo.
-    Returns None on error.
-    """
     try:
         url = f"https://api.telegram.org/bot{bot_token}/getWebhookInfo"
         with urllib.request.urlopen(url, timeout=5) as resp:
@@ -118,46 +140,87 @@ def check_service_health(service_config: dict) -> dict:
 
     age = _log_age_seconds(log_path)
     if age is None or age <= WATCHDOG_FREEZE_THRESHOLD:
-        msg = f"{desc} 健康（日志更新于 {age:.0f}s 前）" if age is not None else f"{desc} 运行中（日志不存在）"
+        msg = (f"{desc} 健康（日志更新于 {age:.0f}s 前）"
+               if age is not None else f"{desc} 运行中（日志不存在）")
         logger.debug("[watchdog] %s", msg)
         return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
 
     # Log is stale — check if Telegram actually has queued messages
     pending = _get_telegram_pending(OPENCLAW_BOT_TOKEN)
     if pending is None:
-        # Can't determine — skip to avoid false alarm
         logger.info("[watchdog] %s log stale (%.0fs) but Telegram check failed — skipping", desc, age)
         return {
             "service": key, "running": True, "frozen": False, "log_age": age,
-            "message": f"{desc} 日志陈旧 {age:.0f}s，但无法确认是否冻结（Telegram API 不可达）",
+            "message": f"{desc} 日志陈旧 {age:.0f}s，无法确认冻结（Telegram API 不可达）",
         }
 
     if pending == 0:
-        logger.info("[watchdog] %s log stale (%.0fs) but no pending Telegram msgs — idle, not frozen", desc, age)
+        logger.info("[watchdog] %s log stale (%.0fs) but no pending msgs — idle", desc, age)
         return {
             "service": key, "running": True, "frozen": False, "log_age": age,
-            "message": f"{desc} 空闲中（日志 {age:.0f}s 未更新，但 Telegram 无积压消息）",
+            "message": f"{desc} 空闲（日志 {age:.0f}s 未更新，Telegram 无积压消息）",
         }
 
-    # Log stale AND pending messages → genuinely frozen
-    logger.warning("[watchdog] %s FROZEN: log stale %.0fs + %d pending Telegram msgs", desc, age, pending)
+    logger.warning("[watchdog] %s FROZEN: log stale %.0fs + %d pending Telegram msgs",
+                   desc, age, pending)
     return {
         "service": key, "running": True, "frozen": True, "log_age": age,
         "message": f"{desc} 冻结（日志 {age:.0f}s 未更新，Telegram 积压 {pending} 条消息）",
     }
 
 
-def _trigger_agent_rescue(service_key: str, description: str, result: dict) -> None:
+def _smart_triage(service_key: str, description: str, anomaly_summary: str) -> bool:
+    """
+    Single LLM call to confirm whether this is a real incident.
+    Returns True if it's confirmed real, False if likely false alarm.
+    """
+    try:
+        import anthropic
+        client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            base_url=ANTHROPIC_BASE_URL,
+        )
+        prompt = (
+            f"服务监控检测到以下异常信号：{anomaly_summary}\n\n"
+            f"服务：{description} ({service_key})\n\n"
+            "请判断：这是一个需要立即处理的真实故障，还是可能的误报？\n"
+            "只回答 YES（真实故障，需要立即介入）或 NO（可能误报，暂时观察），"
+            "后面可以加一句简短理由（不超过20字）。"
+        )
+        msg = client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=50,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        answer = msg.content[0].text.strip().upper()
+        is_real = answer.startswith("YES")
+        logger.info("[watchdog] Smart Triage for %s: %s → confirmed=%s", service_key, answer, is_real)
+        return is_real
+    except Exception as e:
+        logger.error("[watchdog] Smart Triage failed for %s: %s — defaulting to YES", service_key, e)
+        return True  # fail-safe: treat as real
+
+
+def _trigger_agent_rescue(service_key: str, description: str, health: dict) -> None:
+    if _in_cooldown(service_key):
+        return
+
+    anomaly_summary = health.get("message", "服务异常")
+
+    # Smart Triage: single LLM call to confirm
+    if not _smart_triage(service_key, description, anomaly_summary):
+        logger.info("[watchdog] Smart Triage says false alarm for %s — skipping rescue", service_key)
+        return
+
+    # Mark cooldown before rescue starts (prevents overlapping rescues)
+    _last_rescue[service_key] = time.time()
+
     quiet = is_quiet_hours()
     chat_id = ADMIN_CHAT_ID if not quiet else None
 
-    log_age = result.get("log_age")
-    pending_info = f"，Telegram 积压消息待处理" if result.get("frozen") else ""
-    age_info = f"日志已 {log_age:.0f} 秒未更新{pending_info}" if log_age else "进程已停止"
-
     task = (
-        f"系统监控检测到 {description} ({service_key}) 服务异常：{age_info}。"
-        f"请执行急救流程：检查状态→读取日志→诊断→重启→验证→汇报。"
+        f"系统监控确认 {description} ({service_key}) 服务异常：{anomaly_summary}。"
+        f"请执行急救流程：检查状态→读取日志→诊断→修复/重启→验证→汇报。"
     )
 
     logger.warning("[watchdog] Triggering Agent rescue for %s (quiet=%s)", service_key, quiet)
@@ -168,15 +231,14 @@ def _trigger_agent_rescue(service_key: str, description: str, result: dict) -> N
         logger.info("[watchdog] Rescue completed for %s: %s", service_key, result_text[:200])
     except Exception as e:
         logger.exception("[watchdog] Agent rescue failed for %s: %s", service_key, e)
+        # Fallback: direct restart
         try:
-            from workers.openclaw_worker import restart_service
             r = restart_service(service_key)
-            logger.info("[watchdog] Fallback restart for %s: %s", service_key,
-                        "OK" if r.get("success") else "FAILED")
-            if not quiet and chat_id and r.get("success"):
-                from tools.notify_tools import send_notification_sync
-                send_notification_sync(
-                    f"⚠️ {description} 异常，已直接重启（Agent 不可用）", chat_id=chat_id)
+            ok = r.get("success", False)
+            logger.info("[watchdog] Fallback restart for %s: %s", service_key, "OK" if ok else "FAILED")
+            if not quiet and chat_id and ok:
+                from tools.notify_tools import send_sync
+                send_sync(f"⚠️ {description} 异常，已直接重启（Agent 不可用）", chat_id)
         except Exception as e2:
             logger.exception("[watchdog] Fallback restart error: %s", e2)
 
@@ -192,15 +254,17 @@ def run_watchdog_once() -> list[dict]:
                 _trigger_agent_rescue(svc["key"], svc["description"], r)
         except Exception as e:
             logger.exception("[watchdog] Error checking %s: %s", svc["key"], e)
-            results.append({"service": svc["key"], "running": None, "frozen": None,
-                            "log_age": None, "message": f"检查出错: {e}"})
+            results.append({
+                "service": svc["key"], "running": None, "frozen": None,
+                "log_age": None, "message": f"检查出错: {e}",
+            })
     return results
 
 
 def run_watchdog_loop() -> None:
     logger.info(
-        "[watchdog] Starting loop (interval=%ds, openclaw_freeze_threshold=%ds, quiet=%s-%s)",
-        WATCHDOG_CHECK_INTERVAL, WATCHDOG_FREEZE_THRESHOLD,
+        "[watchdog] Starting loop (interval=%ds, freeze_threshold=%ds, cooldown=%ds, quiet=%s-%s)",
+        WATCHDOG_CHECK_INTERVAL, WATCHDOG_FREEZE_THRESHOLD, RESCUE_COOLDOWN,
         f"{WATCHDOG_QUIET_HOURS_START:02d}:00", f"{WATCHDOG_QUIET_HOURS_END:02d}:00",
     )
     while True:
@@ -213,12 +277,14 @@ def run_watchdog_loop() -> None:
 
 if __name__ == "__main__":
     import argparse
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                        handlers=[
-                            logging.FileHandler(str(Path(__file__).parent / "logs" / "watchdog.log")),
-                            logging.StreamHandler(),
-                        ])
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(str(Path(__file__).parent / "logs" / "watchdog.log")),
+            logging.StreamHandler(),
+        ],
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
