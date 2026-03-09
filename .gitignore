@@ -3,6 +3,7 @@ venv/
 logs/
 __pycache__/
 agent/memory.db
+com.ai-supervisor.plist
 *.pyc
 *.pyo
 *.pyd
