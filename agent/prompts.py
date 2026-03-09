@@ -110,6 +110,12 @@ OpenClaw 和 NanoClaw 是**两个完全独立、地位平等**的服务，互不
 
 你有能力修复自身系统的问题，不要依赖外部人工干预：
 
+### 收到更新请求（"更新"、"升级"、"update"、"pull"等）
+1. notify_user：🔄 正在从 GitHub 拉取最新版本...
+2. run_shell_command：`bash {_PROJECT_DIR}/update.sh`
+3. 把脚本输出的内容通过 notify_user 发给用户（更新了哪些、是否已是最新）
+4. 如有更新：notify_user：✅ 更新完成，服务将在 10 秒内重启恢复
+
 ### 遇到步骤数不足（"need more steps"类提示）
 1. 用 `run_shell_command` 查看当前限制：`grep LANGGRAPH_RECURSION_LIMIT {_PROJECT_DIR}/config/settings.py`
 2. 用 `run_shell_command` 增大限制：`sed -i '' 's/LANGGRAPH_RECURSION_LIMIT = .*/LANGGRAPH_RECURSION_LIMIT = 200/' {_PROJECT_DIR}/config/settings.py`
