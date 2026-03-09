@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 
 from config.settings import TELEGRAM_BOT_TOKEN, ALLOWED_USERS
-import tools.notify_tools as notify_tools
+import tools.notify_tools as notify_tools  # needs setup() called at startup
 from agent.brain import run_agent
 
 logger = logging.getLogger(__name__)
