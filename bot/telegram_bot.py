@@ -116,9 +116,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/run `<命令>` — 执行 Shell 命令\n"
         "/claude `<任务>` — 调用 Claude Code\n\n"
         "💡 也可以直接用自然语言描述，例如：\n"
-        "• "OpenClaw 没回复了，帮我检查一下"\n"
-        "• "查看最近的错误日志"\n"
-        "• "重启 nanoclaw 并验证是否正常""
+        "- OpenClaw 没回复了，帮我检查一下\n"
+        "- 查看最近的错误日志\n"
+        "- 重启 nanoclaw 并验证是否正常"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
