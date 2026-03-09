@@ -230,6 +230,27 @@ def _is_history_corruption(err: Exception) -> bool:
     return "tool_use_id" in s or ("tool_result" in s and "400" in s)
 
 
+# LangGraph prebuilt agent returns this as plain text (not an exception) when
+# the recursion limit is hit.  We detect it and convert to a real error so the
+# self-heal pipeline can deal with it.
+_LIMIT_PHRASES = (
+    "sorry, need more steps",
+    "need more steps to process",
+    "agent stopped due to",
+)
+
+
+def _check_limit_response(response: str) -> None:
+    """Raise RuntimeError if the response indicates the agent hit its step limit."""
+    lower = response.lower()
+    if any(phrase in lower for phrase in _LIMIT_PHRASES):
+        raise RuntimeError(
+            f"Agent hit recursion limit (LANGGRAPH_RECURSION_LIMIT="
+            f"{LANGGRAPH_RECURSION_LIMIT}). "
+            f"Fix: increase LANGGRAPH_RECURSION_LIMIT in config/settings.py."
+        )
+
+
 def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
     agent = get_agent()
 
@@ -245,7 +266,9 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             {"messages": [{"role": "user", "content": task}]},
             config=_make_config(str(thread_id)),
         )
-        return _extract_last_ai_message(result)
+        response = _extract_last_ai_message(result)
+        _check_limit_response(response)   # raises if agent hit step limit
+        return response
 
     except Exception as e:
         if _is_history_corruption(e):
@@ -259,7 +282,9 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
                     {"messages": [{"role": "user", "content": task}]},
                     config=_make_config(fresh_tid),
                 )
-                return _extract_last_ai_message(result)
+                response = _extract_last_ai_message(result)
+                _check_limit_response(response)
+                return response
             except Exception as e2:
                 # Fall through to Tier-2 self-heal
                 e = e2
