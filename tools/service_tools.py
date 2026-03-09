@@ -1,6 +1,5 @@
 """
 service_tools.py — LangGraph tools for checking and restarting services.
-Wraps workers/openclaw_worker.py logic as @tool functions.
 """
 from __future__ import annotations
 
@@ -10,30 +9,38 @@ from workers.openclaw_worker import get_service_status, restart_service, get_all
 
 logger = logging.getLogger(__name__)
 
+_ALIASES = {
+    "nano":    "nanoclaw",
+    "claw":    "openclaw",
+    "gateway": "openclaw",
+}
+
+def _resolve(name: str) -> str:
+    n = name.strip().lower()
+    return _ALIASES.get(n, n)
+
 
 @tool
 def check_service(service: str = "all") -> str:
     """
-    检查服务状态。
+    检查服务运行状态。
 
     Args:
-        service: 服务名称，可选值：openclaw、nanoclaw、all（默认）
+        service: 服务名，支持缩写。可选：openclaw（或 gateway/claw）、
+                 nanoclaw（或 nano）、all（默认，查所有）
 
     Returns:
-        服务状态描述文字
+        服务状态描述
     """
-    service = service.strip().lower()
-    if service == "all" or not service:
+    svc = _resolve(service) if service else "all"
+    if svc in ("all", ""):
         return get_all_status()
-
-    if service not in ("openclaw", "nanoclaw"):
-        return f"❌ 未知服务：{service}。可选：openclaw、nanoclaw、all"
-
-    st = get_service_status(service)
+    if svc not in ("openclaw", "nanoclaw"):
+        return f"❌ 未知服务：{service}（识别为 '{svc}'）。已知服务：openclaw、nanoclaw"
+    st = get_service_status(svc)
     icon = "✅" if st.get("running") else "❌"
     pid_str = f"PID={st.get('pid')}" if st.get("pid") else "未运行"
-    status_str = st.get("status", "?")
-    return f"{icon} {service}: {status_str} ({pid_str})"
+    return f"{icon} {svc}: {st.get('status', '?')} ({pid_str})"
 
 
 @tool
@@ -42,25 +49,20 @@ def restart_service_tool(service: str) -> str:
     重启指定服务。
 
     Args:
-        service: 服务名称，可选值：openclaw、nanoclaw、all
+        service: 服务名，支持缩写。可选：openclaw（或 gateway/claw）、
+                 nanoclaw（或 nano）、all（重启所有）
 
     Returns:
-        重启结果描述
+        重启结果
     """
-    service = service.strip().lower()
-    if service not in ("openclaw", "nanoclaw", "all"):
-        return f"❌ 未知服务：{service}。可选：openclaw、nanoclaw、all"
-
-    if service == "all":
+    svc = _resolve(service)
+    if svc not in ("openclaw", "nanoclaw", "all"):
+        return f"❌ 未知服务：{service}（识别为 '{svc}'）。已知服务：openclaw、nanoclaw"
+    if svc == "all":
         results = []
-        for svc in ("openclaw", "nanoclaw"):
-            r = restart_service(svc)
-            icon = "✅" if r.get("success") else "❌"
-            results.append(f"{icon} {svc}: {'重启成功' if r.get('success') else '重启失败'}")
+        for s in ("openclaw", "nanoclaw"):
+            r = restart_service(s)
+            results.append(f"{'✅' if r.get('success') else '❌'} {s}: {'重启成功' if r.get('success') else '重启失败'}")
         return "\n".join(results)
-
-    r = restart_service(service)
-    if r.get("success"):
-        return f"✅ {service} 重启成功，服务正在运行"
-    else:
-        return f"❌ {service} 重启失败：{r.get('error', '未知错误')}"
+    r = restart_service(svc)
+    return f"✅ {svc} 重启成功" if r.get("success") else f"❌ {svc} 重启失败：{r.get('error', '未知错误')}"

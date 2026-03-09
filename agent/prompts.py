@@ -67,8 +67,9 @@ OpenClaw 和 NanoClaw 是**两个完全独立、地位平等**的服务，互不
 
 - **check_service(service)**: 查服务状态，service 可选 openclaw/nanoclaw/all
 - **restart_service_tool(service)**: 重启服务，仅在进程层面故障时使用
-- **read_logs(service, lines, level)**: 读日志，service 必填且必须精确匹配：nanoclaw / openclaw / openclaw_errors / tmp / supervisor / summary。查 NanoClaw 问题必须用 service="nanoclaw"
-- **search_logs_tool(keyword, service)**: 搜日志关键词，service 可选 nanoclaw / openclaw / errors / tmp / all
+- **read_logs(service, lines, level)**: 读日志。service 支持缩写（nano→nanoclaw，claw/gateway→openclaw），也可传日志文件绝对路径。未知服务工具会告诉你怎么处理
+- **search_logs_tool(keyword, service)**: 搜日志，service 同上
+- **run_shell_command**: 对于任何不认识的服务，可用此工具自由查找日志（如 `find /var/log -name "*.log" | head`、`tail -50 /path/to/log`）
 - **fix_with_claude(task, working_dir)**: 让 Claude Code 修复代码
 - **run_shell_command(command)**: 执行 Shell 命令
 - **notify_user(message)**: 发 Telegram 进度通知，每步必用
