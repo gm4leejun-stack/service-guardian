@@ -4,15 +4,18 @@ agent/brain.py — singleton LangGraph ReAct Agent.
 Design:
 - One agent instance, built once, reused forever
 - chat_id passed via config["configurable"]["chat_id"] — no closures, no rebuilds
-- Conversation history trimmed to last 20 messages to control token cost
+- Conversation history trimmed to last 20 messages, always starting from a
+  HumanMessage to avoid orphaned tool_result blocks (Anthropic 400 error)
+- Self-healing: on message-history corruption, auto-clear thread and retry once
 - notify_user reads chat_id from RunnableConfig automatically
 """
 from __future__ import annotations
 
+import time
 import logging
 import threading
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import trim_messages
+from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -41,11 +44,21 @@ AGENT_TOOLS = [
 
 
 def _trim_state(state: dict) -> list:
-    """Keep system prompt + last 20 messages to bound token cost."""
+    """Keep last 20 messages, always starting from a HumanMessage.
+
+    Naive tail-slicing can leave orphaned tool_result blocks at the start
+    (when the corresponding tool_use was cut off), which causes Anthropic to
+    return a 400 error.  We scan forward after trimming to find the first
+    HumanMessage so the history is always structurally valid.
+    """
     messages = state.get("messages", [])
     if len(messages) <= 20:
         return messages
-    return messages[-20:]
+    trimmed = messages[-20:]
+    for i, msg in enumerate(trimmed):
+        if isinstance(msg, HumanMessage):
+            return trimmed[i:]
+    return trimmed  # fallback: no HumanMessage found, return as-is
 
 
 def get_agent():
@@ -72,32 +85,67 @@ def get_agent():
         return _agent
 
 
+def _extract_last_ai_message(result: dict) -> str:
+    for msg in reversed(result.get("messages", [])):
+        role = getattr(msg, "type", None) or getattr(msg, "role", None)
+        if role in ("ai", "assistant"):
+            content = msg.content
+            if isinstance(content, list):
+                parts = [c["text"] for c in content
+                         if isinstance(c, dict) and c.get("type") == "text"]
+                return "\n".join(parts) if parts else ""
+            return str(content)
+    return ""
+
+
+def _is_history_corruption(err: Exception) -> bool:
+    """True if the error is an orphaned tool_result / tool_use mismatch."""
+    s = str(err)
+    return "tool_use_id" in s or ("tool_result" in s and "400" in s)
+
+
 def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
     agent = get_agent()
-    config = {
-        "configurable": {
-            "thread_id": str(thread_id),
-            "chat_id": chat_id,
-        },
-        "recursion_limit": LANGGRAPH_RECURSION_LIMIT,
-    }
+
+    def _make_config(tid: str) -> dict:
+        return {
+            "configurable": {"thread_id": tid, "chat_id": chat_id},
+            "recursion_limit": LANGGRAPH_RECURSION_LIMIT,
+        }
+
+    logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
     try:
-        logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
         result = agent.invoke(
             {"messages": [{"role": "user", "content": task}]},
-            config=config,
+            config=_make_config(str(thread_id)),
         )
-        for msg in reversed(result.get("messages", [])):
-            role = getattr(msg, "type", None) or getattr(msg, "role", None)
-            if role in ("ai", "assistant"):
-                content = msg.content
-                if isinstance(content, list):
-                    parts = [c["text"] for c in content
-                             if isinstance(c, dict) and c.get("type") == "text"]
-                    return "\n".join(parts) if parts else ""
-                return str(content)
-        return ""
+        return _extract_last_ai_message(result)
+
     except Exception as e:
+        if _is_history_corruption(e):
+            # Self-healing: history corruption — retry with a fresh thread
+            fresh_tid = f"{thread_id}_fresh_{int(time.time())}"
+            logger.warning(
+                "[brain] History corruption in thread %s — retrying with fresh thread %s",
+                thread_id, fresh_tid,
+            )
+            # Notify user so they know what happened
+            try:
+                from tools.notify_tools import send_sync
+                if chat_id:
+                    send_sync("⚠️ 检测到对话历史异常，正在自动修复并重试...", chat_id)
+            except Exception:
+                pass
+            try:
+                result = agent.invoke(
+                    {"messages": [{"role": "user", "content": task}]},
+                    config=_make_config(fresh_tid),
+                )
+                return _extract_last_ai_message(result)
+            except Exception as e2:
+                logger.exception("[brain] Retry after self-heal also failed: %s", e2)
+                return f"❌ 自愈重试失败: {e2}"
+
         logger.exception("[brain] error: %s", e)
         return f"❌ Agent 执行错误: {e}"
 
