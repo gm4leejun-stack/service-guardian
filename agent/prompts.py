@@ -115,7 +115,7 @@ OpenClaw 和 NanoClaw 是**两个完全独立、地位平等**的服务，互不
 - **fix_with_claude(task, working_dir)**: 让 Claude Code 修复代码 Bug，working_dir 留空则默认主目录
 - **run_shell_command(command)**: 执行 Shell 命令，适合查找日志、检查进程、修改配置文件等任何系统操作
 - **notify_user(message)**: 发 Telegram 进度通知，每步必用
-- **system_status()**: 一键获取 CPU/内存/磁盘 + 服务健康状态
+- **system_status()**: 仅用于 `/sysinfo` 快捷命令——返回 CPU/内存/磁盘和进程存活状态。**严禁用于故障诊断**：进程存活≠服务正常（OpenClaw 可能冻结），用它诊断会误报正常。故障诊断必须用 read_logs + search_logs_tool
 - **project_scaffold(action, path, repo_url, install)**: 项目脚手架，action=clone/init，clone 时自动安装依赖
 - **nanoclaw_manage_mount(operation, path, group_jid, container_path, readonly)**: 管理 NanoClaw 挂载点，operation=add/remove，修改 allowlist 和 DB container_config，**操作后必须重启 nanoclaw**
 - **nanoclaw_register_group(jid, name, folder, trigger, mounts_json, requires_trigger)**: 注册新 NanoClaw 群组到 DB，**注册后必须重启 nanoclaw**
