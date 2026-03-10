@@ -16,7 +16,6 @@ notify_user: Claude Code calls notify_cli.py via Bash:
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -68,8 +67,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
 
-    cmd = [_CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
-           "--output-format", "json"]
+    cmd = [_CLAUDE_BIN, "--print", "--dangerously-skip-permissions"]
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -88,30 +86,13 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
-        # Parse JSON output to extract result text and session_id
-        if stdout:
-            try:
-                data = json.loads(stdout)
-                # Save session_id for next call
-                new_session = data.get("session_id")
-                if new_session:
-                    with _sessions_lock:
-                        sessions = _load_sessions()
-                        sessions[thread_id] = new_session
-                        _save_sessions(sessions)
-                reply = data.get("result") or data.get("content") or ""
-                if reply:
-                    return str(reply)
-            except json.JSONDecodeError:
-                # Fallback: raw text output
-                return stdout
+        logger.info("[brain] claude rc=%d stdout_len=%d", result.returncode, len(stdout))
 
         if result.returncode != 0:
-            err = stderr[:500] if stderr else "(no error output)"
+            err = stderr[:500] if stderr else stdout[:500] or "(no output)"
             logger.error("[brain] claude error rc=%d: %s", result.returncode, err)
-            # Retry without session if session may be stale
-            if session_id and "session" in err.lower():
-                logger.info("[brain] Clearing stale session %s for thread %s", session_id, thread_id)
+            if session_id and ("session" in err.lower() or "resume" in err.lower()):
+                logger.info("[brain] Clearing stale session for thread %s", thread_id)
                 with _sessions_lock:
                     sessions = _load_sessions()
                     sessions.pop(thread_id, None)
