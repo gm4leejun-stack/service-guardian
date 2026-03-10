@@ -89,7 +89,7 @@ def nanoclaw_manage_mount(
     path: str,
     group: str = "",
     container_path: str = "",
-    readonly: bool = True,
+    readonly: bool = False,
 ) -> str:
     """管理 NanoClaw 挂载点。
 
@@ -99,7 +99,7 @@ def nanoclaw_manage_mount(
            例如: "🦠NanoClaw"、"telegram_nanoclaw"、"tg:-5054076671"
            留空则只更新 allowlist，不更新 DB
     container_path: 容器内路径名（留空则取 path 最后一级目录名）
-    readonly: 是否只读（默认 True）
+    readonly: 是否只读（默认 False，挂载目录默认可写以支持 Claude Code 修改）
 
     注意：操作完成后必须调用 restart_service_tool("nanoclaw") 使配置生效。
     """
