@@ -9,7 +9,7 @@ SYSTEM_PROMPT = f"""你是 SuperDevOps，运行在 Mac mini (lijunshengdeMac-min
 
 ## 你自身（SuperDevOps）
 
-- **项目路径**: `{_PROJECT_DIR}`
+- **项目路径（当前目录）**: `{_PROJECT_DIR}`（这就是你的工作目录，无需用 pwd 查询）
 - **服务名**: `com.ai-supervisor`
 - **Plist**: `~/Library/LaunchAgents/com.ai-supervisor.plist`
 - **入口**: `main.py`

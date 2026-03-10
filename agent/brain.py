@@ -159,40 +159,17 @@ _STEP_LIMIT_SIGNALS = [
 
 def _is_step_limit_response(text: str, result: dict | None = None,
                              limit: int | None = None) -> bool:
-    """Detect step-limit exhaustion via two independent signals.
+    """Detect step-limit exhaustion.
 
-    Signal A (structural): message count consumed ≥ 80% of the *actual* recursion
-                           limit used for this invocation AND last AI message has no
-                           pending tool_calls.
-                           Catches LangGraph-level exhaustion regardless of output text.
+    Signal A (structural) was removed: result["messages"] contains the full
+    SqliteSaver history (can be 500+ messages), not the per-invocation step count.
+    Any message-count threshold would compare against the wrong quantity and produce
+    false positives on long-running conversations — exactly what happened in practice.
+    GraphRecursionError (the exception path) already covers structural exhaustion.
 
-    Signal B (text): proxy-level "need more steps" messages that bypass LangGraph.
-                     Kept as fallback — fragile to wording changes, but necessary
-                     because proxy throttling doesn't raise a Python exception.
-
-    Either signal alone is sufficient to trigger Tier-0 retry.
-
-    Args:
-        limit: The recursion_limit actually used for this invocation.
-               Defaults to LANGGRAPH_RECURSION_LIMIT when not supplied.
-               Must be passed explicitly in Tier-0 retry to avoid false positives
-               (e.g. 90 messages at limit=200 must NOT be flagged as exhausted).
+    Signal B (text): proxy-level "need more steps" that bypasses LangGraph exceptions.
+    This is the only reliable signal for proxy throttling.
     """
-    from langchain_core.messages import AIMessage
-
-    effective_limit = limit if limit is not None else LANGGRAPH_RECURSION_LIMIT
-
-    if result is not None:
-        messages = result.get("messages", [])
-        # Signal A: high step consumption + agent stopped calling tools
-        if len(messages) >= effective_limit * 0.8:
-            last_ai = next(
-                (m for m in reversed(messages) if isinstance(m, AIMessage)), None
-            )
-            if last_ai is not None and not getattr(last_ai, "tool_calls", None):
-                return True
-
-    # Signal B: proxy text (fallback)
     t = text.lower()
     return any(sig in t for sig in _STEP_LIMIT_SIGNALS)
 
@@ -313,7 +290,7 @@ def _retry_with_higher_limit(
             config=_make_bumped_config(str(thread_id)),
         )
         reply = _extract_last_ai_message(result)
-        if _is_step_limit_response(reply, result, limit=bumped):
+        if _is_step_limit_response(reply):
             # Still failing after bump — escalate to Tier-2
             err = RuntimeError(f"Step limit persists even at limit={bumped}")
             logger.error("[brain] Tier-0 retry still hit step limit, escalating to Tier-2")
@@ -363,7 +340,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         reply = _extract_last_ai_message(result)
         # Tier-0: step limit hit (structural signal or proxy text).
         # Correct response: bump the limit and retry once — no code change, no restart.
-        if _is_step_limit_response(reply, result, limit=LANGGRAPH_RECURSION_LIMIT):
+        if _is_step_limit_response(reply):
             return _retry_with_higher_limit(task, chat_id, thread_id, _make_config)
         return reply
 
