@@ -37,7 +37,7 @@ from config.settings import (
     ADMIN_CHAT_ID,
     ANTHROPIC_API_KEY,
     ANTHROPIC_BASE_URL,
-    HAIKU_MODEL,
+    CLAUDE_MODEL,
 )
 from tools.service_tools import get_service_status, restart_service
 
@@ -188,7 +188,7 @@ def _smart_triage(service_key: str, description: str, anomaly_summary: str) -> b
             "后面可以加一句简短理由（不超过20字）。"
         )
         msg = client.messages.create(
-            model=HAIKU_MODEL,
+            model=CLAUDE_MODEL,
             max_tokens=50,
             messages=[{"role": "user", "content": prompt}],
         )
