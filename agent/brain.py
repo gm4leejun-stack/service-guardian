@@ -28,7 +28,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.errors import GraphRecursionError
 
-from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, HAIKU_MODEL, LANGGRAPH_RECURSION_LIMIT
+from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, CLAUDE_MODEL, LANGGRAPH_RECURSION_LIMIT
 from agent.prompts import SYSTEM_PROMPT
 from tools.service_tools import check_service, restart_service_tool
 from tools.log_tools import read_logs, search_logs_tool
@@ -111,7 +111,7 @@ def get_agent():
         if _agent:
             return _agent
         llm = ChatAnthropic(
-            model=HAIKU_MODEL,
+            model=CLAUDE_MODEL,
             api_key=ANTHROPIC_API_KEY,
             base_url=ANTHROPIC_BASE_URL,
             temperature=0,
@@ -125,7 +125,7 @@ def get_agent():
             checkpointer=checkpointer,
             prompt=_trim_state,
         )
-        logger.info("[brain] agent ready: %s  (memory: %s)", HAIKU_MODEL, _DB_PATH)
+        logger.info("[brain] agent ready: %s  (memory: %s)", CLAUDE_MODEL, _DB_PATH)
         return _agent
 
 
