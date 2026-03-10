@@ -35,6 +35,8 @@ from tools.log_tools import read_logs, search_logs_tool
 from tools.shell_tools import run_shell_command
 from tools.claude_tools import fix_with_claude
 from tools.notify_tools import notify_user
+from tools.nanoclaw_tools import nanoclaw_manage_mount, nanoclaw_register_group
+from tools.system_tools import system_status, project_scaffold
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,10 @@ AGENT_TOOLS = [
     run_shell_command,
     fix_with_claude,
     notify_user,
+    nanoclaw_manage_mount,
+    nanoclaw_register_group,
+    system_status,
+    project_scaffold,
 ]
 
 
@@ -141,6 +147,46 @@ def _is_transient_error(err: Exception) -> bool:
     ])
 
 
+# Patterns that indicate the LLM hit its step limit and gave up mid-task.
+# These come from LangGraph proxy responses rather than Python exceptions.
+_STEP_LIMIT_SIGNALS = [
+    "need more steps",
+    "sorry, i need more",
+    "cannot complete in",
+    "exceeded the maximum number of steps",
+]
+
+
+def _is_step_limit_response(text: str, result: dict | None = None) -> bool:
+    """Detect step-limit exhaustion via two independent signals.
+
+    Signal A (structural): message count consumed ≥ 80% of recursion limit
+                           AND last AI message has no pending tool_calls.
+                           Catches LangGraph-level exhaustion regardless of output text.
+
+    Signal B (text): proxy-level "need more steps" messages that bypass LangGraph.
+                     Kept as fallback — fragile to wording changes, but necessary
+                     because proxy throttling doesn't raise a Python exception.
+
+    Either signal alone is sufficient to trigger Tier-0 retry.
+    """
+    from langchain_core.messages import AIMessage
+
+    if result is not None:
+        messages = result.get("messages", [])
+        # Signal A: high step consumption + agent stopped calling tools
+        if len(messages) >= LANGGRAPH_RECURSION_LIMIT * 0.8:
+            last_ai = next(
+                (m for m in reversed(messages) if isinstance(m, AIMessage)), None
+            )
+            if last_ai is not None and not getattr(last_ai, "tool_calls", None):
+                return True
+
+    # Signal B: proxy text (fallback)
+    t = text.lower()
+    return any(sig in t for sig in _STEP_LIMIT_SIGNALS)
+
+
 def _notify(message: str, chat_id: int | None) -> None:
     if not chat_id:
         return
@@ -231,6 +277,64 @@ def _is_history_corruption(err: Exception) -> bool:
     return "tool_use_id" in s or ("tool_result" in s and "400" in s)
 
 
+def _retry_with_higher_limit(
+    task: str, chat_id: int | None, thread_id: str, make_config_fn
+) -> str:
+    """Tier-0 self-heal: step limit hit → double the limit and retry once.
+
+    This is the correct fix for step-limit failures: increase capacity and
+    re-run the same task. No code change, no service restart needed.
+    If the retry also fails, escalate to Tier-2 (code bug path).
+    """
+    bumped = LANGGRAPH_RECURSION_LIMIT * 2
+    logger.warning("[brain] Tier-0: step limit hit, retrying with limit=%d", bumped)
+    _notify(f"⚠️ 步骤数不足，正在以更高限制（{bumped}步）重试...", chat_id)
+
+    def _make_bumped_config(tid: str) -> dict:
+        return {
+            "configurable": {"thread_id": tid, "chat_id": chat_id},
+            "recursion_limit": bumped,
+        }
+
+    try:
+        agent = get_agent()
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": task}]},
+            config=_make_bumped_config(str(thread_id)),
+        )
+        reply = _extract_last_ai_message(result)
+        if _is_step_limit_response(reply, result):
+            # Still failing after bump — escalate to Tier-2
+            err = RuntimeError(f"Step limit persists even at limit={bumped}")
+            logger.error("[brain] Tier-0 retry still hit step limit, escalating to Tier-2")
+            threading.Thread(
+                target=_run_self_heal,
+                args=(err, task[:300], chat_id),
+                daemon=True,
+                name="self-heal",
+            ).start()
+            return "❌ 重试后仍超步骤限制，已启动 Claude Code 自动修复"
+        return reply
+    except GraphRecursionError as e:
+        err = RuntimeError(f"GraphRecursionError at bumped limit={bumped}: {e}")
+        threading.Thread(
+            target=_run_self_heal,
+            args=(err, task[:300], chat_id),
+            daemon=True,
+            name="self-heal",
+        ).start()
+        return "❌ 重试后仍超步骤限制，已启动 Claude Code 自动修复"
+    except Exception as e:
+        if not _is_transient_error(e):
+            threading.Thread(
+                target=_run_self_heal,
+                args=(e, task[:300], chat_id),
+                daemon=True,
+                name="self-heal",
+            ).start()
+        return f"❌ 重试失败: {e}"
+
+
 def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
     agent = get_agent()
 
@@ -246,19 +350,17 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             {"messages": [{"role": "user", "content": task}]},
             config=_make_config(str(thread_id)),
         )
-        return _extract_last_ai_message(result)
+        reply = _extract_last_ai_message(result)
+        # Tier-0: step limit hit (structural signal or proxy text).
+        # Correct response: bump the limit and retry once — no code change, no restart.
+        if _is_step_limit_response(reply, result):
+            return _retry_with_higher_limit(task, chat_id, thread_id, _make_config)
+        return reply
 
     except GraphRecursionError as e:
-        # LangGraph hit its step limit — route directly to Tier-2 self-heal
-        # (not transient, not history corruption — agent needs to raise its own limit)
+        # Tier-0 (exception path): LangGraph itself hit the recursion cap.
         logger.warning("[brain] GraphRecursionError in thread %s: %s", thread_id, e)
-        threading.Thread(
-            target=_run_self_heal,
-            args=(e, task[:300], chat_id),
-            daemon=True,
-            name="self-heal",
-        ).start()
-        return "❌ 步骤数超限，已启动 Claude Code 自动修复（将提升递归限制并重启服务）"
+        return _retry_with_higher_limit(task, chat_id, thread_id, _make_config)
 
     except Exception as e:
         if _is_history_corruption(e):
