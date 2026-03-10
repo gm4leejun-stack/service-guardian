@@ -8,26 +8,23 @@
 
 ## 修改代码后必须执行
 
-每次修改代码后，**必须**按顺序完成以下步骤：
+**重启和验证**：每次修改代码后必须执行：
+```bash
+launchctl stop com.ai-supervisor && sleep 2 && launchctl start com.ai-supervisor
+launchctl list com.ai-supervisor | grep PID
+```
 
-1. **提交到 GitHub**
-   ```bash
-   git add <修改的文件>
-   git commit -m "<简洁描述改动内容>"
-   git push origin master
-   ```
+**提交 GitHub**：以下情况才提交，不是每次文件改动都提交：
+- 完成一个完整的 bug 修复
+- 完成一个完整的新功能
+- 用户明确要求提交
+- 一次对话结束前，若有未提交的有意义改动
 
-2. **重启服务**
-   ```bash
-   launchctl stop com.ai-supervisor && sleep 2 && launchctl start com.ai-supervisor
-   ```
-
-3. **验证服务恢复**
-   ```bash
-   launchctl list com.ai-supervisor | grep PID
-   ```
-
-以上三步缺一不可，不得跳过。
+```bash
+git add <修改的文件>
+git commit -m "<简洁描述改动内容>"
+git push origin master
+```
 
 ## 代码修改原则
 
