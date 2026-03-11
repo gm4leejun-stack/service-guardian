@@ -80,36 +80,24 @@ python3 /workspace/extra/ai-supervisor/tools/notify_cli.py "🔍 开始诊断...
 
 **绝对禁止向用户询问可以自己查到的信息**：JID、路径、配置值——用 Bash 查，不要问。
 
-## 「消息无反馈」强制诊断步骤
+## 诊断原则
 
-用户报告任何服务"没有反馈/没有回复"时，**第一步必须是读错误日志**，不得跳过：
+**先收集完整信息，理解全貌，再诊断，再行动。**
 
-```bash
-tail -50 ~/.openclaw/logs/gateway.err.log
-```
-
-然后按日志内容决定行动：
-
-| 错误日志内容 | 行动 |
-|---|---|
-| `ctx=N (warn<32000)` / `compaction-safeguard` | ❌ **这是警告，不是错误，绝对禁止修改 contextWindow，绝对禁止改 openclaw.json**。直接跳到第2步检查当前模型 |
-| `model_not_found` / `invalid_model` | 直接查 `~/.openclaw/openclaw.json`，找到错误的模型名，改成可用模型，重启 |
-| `503` / `overloaded` / `rate_limit` | 1. 确认 503 是哪个模型报出来的。2. `openclaw models` 查看当前 Default 模型。3. 若 Default = 报 503 的模型：执行 `openclaw model set <另一个无错误的模型别名>` 切换，重启生效。若不匹配（503 是历史遗留）：不改任何配置，告知用户。❌ **严禁直接编辑 openclaw.json**，❌ **严禁删除或移除任何模型** |
-| **无错误** + 主日志长时间无内容 | 才考虑进程冻结：检查 Telegram pending 消息数 |
-
-**第2步（必须执行，不得跳过）**：读完错误日志后，立即执行：
+收到任何问题报告，第一步是全面了解系统当前状态：
 
 ```bash
-openclaw models
+openclaw models          # 当前激活模型是什么？能用吗？
+launchctl list ai.openclaw.gateway  # 进程在吗？
+tail -20 ~/.openclaw/logs/gateway.err.log  # 有真实错误吗？
 ```
 
-查看当前 Default 模型。若 Default 模型是 GPT（lovbrowser 系列）且 GPT 不可用：
-- ✅ 直接告知用户："当前 Default 模型是 GPT，GPT 不可用，请通过 `openclaw model set <别名>` 切换到可用模型"
-- ❌ 不改任何配置，不重启服务
+收集完之后，用你的判断力综合分析：
+- 日志里的内容是**错误**还是**警告**？警告不等于根因。
+- 激活的模型本身能工作吗？模型不可用时其他分析都是白费。
+- 证据链完整吗？能解释用户描述的症状吗？
 
-❌ **禁止在读错误日志之前就重启或猜测根因。**
-❌ **主日志安静 ≠ 进程冻结**，不得只看主日志就决定重启。
-❌ **`ctx=N (warn<32000)` 和 `compaction-safeguard` 不是根因**，看到这两条直接忽略，继续查当前模型。
+**确定根因后再行动。不确定就如实告知用户，不乱猜不乱改。**
 
 ## 修复决策
 
