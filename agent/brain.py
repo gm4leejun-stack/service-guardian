@@ -78,10 +78,13 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
 
+    _debug_log = str(Path(_SUPERVISOR_DIR) / "logs" / f"claude_debug_{thread_id}.jsonl")
     cmd = [
         _CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
-        "--no-session-persistence",   # skip disk session IO
-        "--max-budget-usd", "1.00",   # cap ~77 tool calls, enough for complex diagnosis+fix tasks
+        "--no-session-persistence",
+        "--max-budget-usd", "1.00",
+        "--output-format", "stream-json",
+        "--debug-file", _debug_log,
     ]
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
@@ -96,10 +99,32 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             env=env,
         )
 
-        stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
 
-        logger.info("[brain] claude rc=%d stdout_len=%d", result.returncode, len(stdout))
+        # stream-json: extract final assistant text from JSON lines
+        stdout = ""
+        tool_call_count = 0
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                import json as _json
+                obj = _json.loads(line)
+                if obj.get("type") == "assistant":
+                    for block in obj.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            stdout += block["text"]
+                        elif block.get("type") == "tool_use":
+                            tool_call_count += 1
+                elif obj.get("type") == "result":
+                    if not stdout:
+                        stdout = obj.get("result", "")
+            except Exception:
+                pass
+
+        logger.info("[brain] claude rc=%d tool_calls=%d stdout_len=%d",
+                    result.returncode, tool_call_count, len(stdout))
 
         if result.returncode != 0:
             err = stderr[:500] if stderr else stdout[:500] or "(no output)"
