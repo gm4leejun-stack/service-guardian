@@ -1,132 +1,145 @@
-# Service Guardian (ai-supervisor)
+# ai-supervisor (Service Guardian)
 
-A self-healing AI Agent that monitors, diagnoses, and automatically repairs OpenClaw and NanoClaw services on your Mac mini.
+Mac mini 上的本地 DevOps Agent，通过 Telegram 管理 OpenClaw 和 NanoClaw 服务。
 
-## Architecture
+## 架构
 
 ```
 Telegram (@jun_xiao_code_bot)
-    ↕ real-time bidirectional
-LangGraph ReAct Agent (Claude Haiku)
-    ↕ tool calls
-Tools:
-  ├── check_service      — service status via launchctl
-  ├── restart_service    — stop + start via launchctl
-  ├── read_logs          — tail log files
-  ├── search_logs        — grep log files
-  ├── fix_with_claude    — delegate code fixes to Claude Code CLI
-  ├── run_shell_command  — safe shell execution
-  └── notify_user        — real-time Telegram progress push
-Watchdog (background thread)
-  → detects log staleness → triggers Agent rescue → quiet hours support
+    ↓
+bot/telegram_bot.py
+    ├── 快速路径（零 LLM）
+    │     /sysinfo → psutil 直接返回
+    │     /nano groups → sqlite3 直接查询
+    │
+    └── 智能路径
+          ↓
+        agent/brain.py
+          → claude --print（Claude Sonnet，全 Mac 权限）
+          → CLAUDE.md 作为系统提示
+          → 最近 5 条对话历史注入，保持上下文连续性
+
+Watchdog（后台线程，每 60s）
+    → OpenClaw: 日志过时 + Telegram pending > 0 才告警
+    → NanoClaw: 进程停止才告警
+    → Smart Triage: Haiku 确认是否真实故障
+    → 静默时段 00:00–08:00，60min 冷却防止告警风暴
+
+Mac Exec Bridge（localhost:18800）
+    → NanoClaw 容器通过 host.docker.internal 访问
+    → 让容器内的 Claude Code 执行 Mac 命令（launchctl 等）
+    → Bearer token 认证，仅绑定 127.0.0.1
 ```
 
-## Setup
+## 快速恢复（重装系统后）
 
-### 1. Install dependencies
+### 1. 克隆项目
 
 ```bash
+git clone https://github.com/gm4leejun-stack/service-guardian.git ~/ai-supervisor
 cd ~/ai-supervisor
-python -m venv venv
+```
+
+### 2. 创建虚拟环境并安装依赖
+
+```bash
+python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Configure secrets
+### 3. 恢复 .env（从密码管理器取回备份）
 
-```bash
-cp .env.example .env
-# Edit .env and fill in:
-#   TELEGRAM_BOT_TOKEN — your bot token from @BotFather
-#   ANTHROPIC_API_KEY  — your Anthropic API key
-#   ADMIN_CHAT_ID      — your Telegram user ID (for watchdog alerts)
+```
+TELEGRAM_BOT_TOKEN=...
+ANTHROPIC_API_KEY=...
+ANTHROPIC_BASE_URL=https://llmapi.lovbrowser.com
+HAIKU_MODEL=anthropic/claude-haiku-4.5
+ADMIN_CHAT_ID=...
+EXEC_BRIDGE_TOKEN=...
+EXEC_BRIDGE_PORT=18800
 ```
 
-### 3. Run manually
+### 4. 安装 LaunchAgent（开机自启）
 
 ```bash
-cd ~/ai-supervisor
-venv/bin/python main.py
+bash ~/ai-supervisor/install.sh
+launchctl load ~/Library/LaunchAgents/com.ai-supervisor.plist
 ```
 
-### 4. Install as LaunchAgent (auto-start on login)
+验证：`launchctl list com.ai-supervisor | grep PID`
 
-```bash
-cd ~/ai-supervisor
-./install.sh
-```
+---
 
-## Configuration
+## NanoClaw 群接入 ai-supervisor
 
-All settings are in `config/settings.py`, loaded from `.env`:
+新建 NanoClaw 群后，发给 **@jun_xiao_code_bot**：
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `ANTHROPIC_BASE_URL` | `https://llmapi.lovbrowser.com` | API proxy URL |
-| `HAIKU_MODEL` | `claude-haiku-4-5-20251001` | LLM model for Agent |
-| `ADMIN_CHAT_ID` | — | Telegram user ID for watchdog alerts |
-| `WATCHDOG_CHECK_INTERVAL` | 60s | How often watchdog checks services |
-| `WATCHDOG_FREEZE_THRESHOLD` | 120s | Log staleness threshold for freeze detection |
-| `WATCHDOG_QUIET_HOURS_START` | 0 (midnight) | Quiet hours start (no Telegram alerts) |
-| `WATCHDOG_QUIET_HOURS_END` | 8 (8am) | Quiet hours end |
+> 帮我把 ~/ai-supervisor 挂载到 [群名] 这个群
 
-## Usage
+ai-supervisor 会自动完成挂载 + 重启 NanoClaw。挂载后：
 
-### Telegram commands
+- 群内 Claude Code 可读写 ai-supervisor 代码
+- 群内 Claude Code 通过 `mac_exec_cli.py` 执行 Mac 命令（launchctl、ps 等）
+- `CLAUDE.md` 自动加载，Claude Code 自动检测执行环境并适配
 
-| Command | Description |
-|---------|-------------|
-| `/status` | Check all service statuses |
-| `/fix openclaw` | Restart OpenClaw gateway |
-| `/fix nanoclaw` | Restart NanoClaw |
-| `/fix all` | Restart all services |
-| `/logs` | Recent OpenClaw logs |
-| `/logs errors` | Error logs |
-| `/logs tmp` | /tmp/openclaw logs |
-| `/logs summary` | Log file sizes |
-| `/logs search <kw>` | Search logs for keyword |
-| `/run <cmd>` | Execute shell command |
-| `/claude <task>` | Run Claude Code task |
+---
 
-### Natural language
+## .env 配置项
 
-You can also speak naturally:
+| 变量 | 说明 |
+|------|------|
+| `TELEGRAM_BOT_TOKEN` | @BotFather 申请的 Bot Token |
+| `ANTHROPIC_API_KEY` | API Key |
+| `ANTHROPIC_BASE_URL` | API 代理地址 |
+| `HAIKU_MODEL` | Watchdog Smart Triage 用的廉价模型 |
+| `ADMIN_CHAT_ID` | Watchdog 告警发送的 Telegram 用户 ID |
+| `EXEC_BRIDGE_TOKEN` | Mac Exec Bridge 的认证 Token（NanoClaw 容器用）|
+| `EXEC_BRIDGE_PORT` | Mac Exec Bridge 端口，默认 18800 |
+
+---
+
+## Telegram 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/sysinfo` | CPU / 内存 / 磁盘 + 服务状态（零延迟）|
+| `/status` | 服务状态（通过 Agent）|
+| `/fix openclaw\|nanoclaw\|all` | 重启服务 |
+| `/logs [errors\|tmp\|summary\|search]` | 查看日志 |
+| `/run <命令>` | 执行 Shell 命令 |
+| `/claude <任务>` | 调用 Claude Code |
+| `/nano groups` | 列出 NanoClaw 群组（零延迟）|
+| `/nano mount add\|remove <路径> <JID>` | 管理挂载 |
+| `/nano register <JID> <name> <folder>` | 注册新群组 |
+| `/scaffold <路径> <repo_url>` | 克隆项目并安装依赖 |
+
+也可以直接用中文描述，例如：
 - "OpenClaw 没回复了，帮我检查一下"
-- "查看最近的错误日志"
-- "重启 nanoclaw 并验证是否正常"
+- "把 ~/ai-supervisor 挂载到 telegram_nanoclaw 群组"
 
-## Auto-rescue flow
+---
 
-When Watchdog detects a frozen service, the Agent automatically:
-
-1. 🔍 Sends initial notification and starts diagnosis
-2. 📋 Reads recent logs (last 100 lines)
-3. ⚠️ Reports findings (error messages, anomalies)
-4. 🔧 Either fixes code (via Claude Code) or restarts service
-5. 🔄 Restarts service if needed
-6. ⏳ Waits and verifies recovery
-7. ✅ Sends final report with resolution summary
-
-## Project structure
+## 项目结构
 
 ```
 ai-supervisor/
-├── .env                    # secrets (not in git)
-├── .env.example            # template
-├── main.py                 # entry point
-├── watchdog.py             # freeze detection + Agent trigger
-├── config/settings.py      # all configuration
+├── .env                      # 密钥（不在 git 中，需备份）
+├── main.py                   # 入口：bot + watchdog + exec bridge
+├── watchdog.py               # 服务巡检 + 自动救援
+├── CLAUDE.md                 # Claude Code 系统提示（执行规则）
+├── config/settings.py        # 所有配置项
 ├── agent/
-│   ├── brain.py            # LangGraph ReAct Agent
-│   └── prompts.py          # system prompt
-├── tools/
-│   ├── service_tools.py    # check_service, restart_service
-│   ├── log_tools.py        # read_logs, search_logs
-│   ├── shell_tools.py      # run_shell_command
-│   ├── claude_tools.py     # fix_with_claude
-│   └── notify_tools.py     # notify_user (real-time Telegram push)
+│   └── brain.py              # claude --print 调用 + 对话历史
 ├── bot/
-│   └── telegram_bot.py     # Telegram bot handlers
-└── workers/                # low-level service/log/shell primitives
+│   └── telegram_bot.py       # Telegram Bot 处理器
+└── tools/
+    ├── service_tools.py       # check_service, restart_service
+    ├── log_tools.py           # read_logs, search_logs
+    ├── shell_tools.py         # run_shell_command
+    ├── notify_tools.py        # notify_user（Telegram 推送）
+    ├── notify_cli.py          # CLI 通知工具（Claude Code 调用）
+    ├── exec_bridge.py         # Mac Exec Bridge HTTP 服务器
+    ├── mac_exec_cli.py        # NanoClaw 容器调用的桥接客户端
+    ├── system_tools.py        # system_status（/sysinfo 快速路径）
+    └── nanoclaw_tools.py      # NanoClaw 群组和挂载管理
 ```
