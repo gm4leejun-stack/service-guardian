@@ -16,6 +16,7 @@ notify_user: Claude Code calls notify_cli.py via Bash:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -55,6 +56,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
     if chat_id:
         notify_hint = (
             f"\n\n[进度通知命令: python3 {_SUPERVISOR_DIR}/tools/notify_cli.py '消息内容' {chat_id}]"
+            f"\n[规则：进度通知命令只用于执行中的中间步骤通知。最终结果必须且只能通过 stdout 输出，不得再用进度通知命令发送最终汇总，否则用户会收到重复消息。]"
         )
     full_task = task + notify_hint
 
