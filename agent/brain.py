@@ -78,7 +78,11 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
 
-    cmd = [_CLAUDE_BIN, "--print", "--dangerously-skip-permissions"]
+    cmd = [
+        _CLAUDE_BIN, "--print", "--dangerously-skip-permissions",
+        "--no-session-persistence",   # skip disk session IO
+        "--max-budget-usd", "0.30",   # cap ~30 tool calls, returns result instead of hanging
+    ]
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
     try:
