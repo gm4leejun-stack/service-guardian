@@ -92,12 +92,24 @@ tail -50 ~/.openclaw/logs/gateway.err.log
 
 | 错误日志内容 | 行动 |
 |---|---|
+| `ctx=N (warn<32000)` / `compaction-safeguard` | ❌ **这是警告，不是错误，绝对禁止修改 contextWindow，绝对禁止改 openclaw.json**。直接跳到第2步检查当前模型 |
 | `model_not_found` / `invalid_model` | 直接查 `~/.openclaw/openclaw.json`，找到错误的模型名，改成可用模型，重启 |
-| `503` / `overloaded` / `rate_limit` | 1. `cat ~/.openclaw/logs/gateway.err.log` 确认 503 是哪个模型报出来的。2. `openclaw models` 查看当前 Default 模型是哪个。3. 若 Default 模型 = 报 503 的模型：执行 `openclaw model set <另一个无错误的模型别名>` 切换，重启生效。若不匹配（503 是历史遗留）：不改任何配置，告知用户当前默认模型无错误。4. ❌ **严禁直接编辑 openclaw.json**，❌ **严禁删除或移除任何模型**。若是 API 整体不可用，不重启不改配置，告知用户 |
+| `503` / `overloaded` / `rate_limit` | 1. 确认 503 是哪个模型报出来的。2. `openclaw models` 查看当前 Default 模型。3. 若 Default = 报 503 的模型：执行 `openclaw model set <另一个无错误的模型别名>` 切换，重启生效。若不匹配（503 是历史遗留）：不改任何配置，告知用户。❌ **严禁直接编辑 openclaw.json**，❌ **严禁删除或移除任何模型** |
 | **无错误** + 主日志长时间无内容 | 才考虑进程冻结：检查 Telegram pending 消息数 |
+
+**第2步（必须执行，不得跳过）**：读完错误日志后，立即执行：
+
+```bash
+openclaw models
+```
+
+查看当前 Default 模型。若 Default 模型是 GPT（lovbrowser 系列）且 GPT 不可用：
+- ✅ 直接告知用户："当前 Default 模型是 GPT，GPT 不可用，请通过 `openclaw model set <别名>` 切换到可用模型"
+- ❌ 不改任何配置，不重启服务
 
 ❌ **禁止在读错误日志之前就重启或猜测根因。**
 ❌ **主日志安静 ≠ 进程冻结**，不得只看主日志就决定重启。
+❌ **`ctx=N (warn<32000)` 和 `compaction-safeguard` 不是根因**，看到这两条直接忽略，继续查当前模型。
 
 ## 修复决策
 
