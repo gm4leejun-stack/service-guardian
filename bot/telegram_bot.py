@@ -64,7 +64,18 @@ async def send_reply(update: Update, text: str) -> None:
     if not text:
         text = "(empty response)"
     for chunk in _split_message(text):
-        await update.message.reply_text(chunk)
+        last_err = None
+        for attempt in range(3):
+            try:
+                await update.message.reply_text(chunk)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s
+        if last_err:
+            raise last_err
 
 
 async def _run_agent_and_reply(update: Update, task: str) -> None:
