@@ -48,11 +48,19 @@ python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "ps aux | grep open
 文件读写（ai-supervisor 目录内）可直接操作挂载路径，无需走桥接。
 
 ## 进度通知
-发送 Telegram 进度通知（每个关键步骤必须发）：
+
+每个关键步骤必须发送进度通知。**chat_id 的来源取决于执行环境**：
+
+**Mac 直接运行（Darwin）**：chat_id 由任务开头的 `[进度通知命令: ...]` 提供，直接用：
 ```bash
 python3 /Users/lijunsheng/ai-supervisor/tools/notify_cli.py "🔍 开始诊断..." <chat_id>
 ```
-chat_id 在每次任务的开头 `[进度通知命令: ...]` 里提供。
+
+**NanoClaw 容器内（Linux）**：从群组 workspace 读取 chat_id，再发通知：
+```bash
+CHAT_ID=$(python3 -c "import json; print(json.load(open('/workspace/group/chat_config.json'))['telegram_chat_id'])")
+python3 /workspace/extra/ai-supervisor/tools/notify_cli.py "🔍 开始诊断..." $CHAT_ID
+```
 
 ## 核心行为准则
 

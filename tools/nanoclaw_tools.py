@@ -22,6 +22,24 @@ logger = logging.getLogger(__name__)
 
 _DB_PATH = Path.home() / "nanoclaw/store/messages.db"
 _ALLOWLIST_PATH = Path.home() / ".config/nanoclaw/mount-allowlist.json"
+_GROUPS_DIR = Path.home() / "nanoclaw/groups"
+
+
+def _write_chat_config(folder: str, jid: str) -> None:
+    """Write chat_config.json to group workspace so Claude Code in the container
+    knows which Telegram chat_id to use for progress notifications.
+
+    JID format: tg:<chat_id>  →  chat_id extracted by stripping "tg:" prefix.
+    """
+    try:
+        chat_id = jid.removeprefix("tg:")
+        group_dir = _GROUPS_DIR / folder
+        group_dir.mkdir(parents=True, exist_ok=True)
+        (group_dir / "chat_config.json").write_text(
+            json.dumps({"telegram_chat_id": chat_id}, indent=2)
+        )
+    except Exception as e:
+        logger.warning("[nanoclaw_tools] Failed to write chat_config for %s: %s", folder, e)
 
 
 def _load_allowlist() -> dict:
@@ -161,11 +179,16 @@ def nanoclaw_manage_mount(
                             "readonly": readonly,
                         })
                         cfg["additionalMounts"] = mounts
+                        folder_row = conn.execute(
+                            "SELECT folder FROM registered_groups WHERE jid = ?", (jid,)
+                        ).fetchone()
                         conn.execute(
                             "UPDATE registered_groups SET container_config = ? WHERE jid = ?",
                             (json.dumps(cfg), jid),
                         )
                         conn.commit()
+                        if folder_row:
+                            _write_chat_config(folder_row[0], jid)
                         results.append(
                             f"已更新群组 '{name_or_err}' ({jid}) 的挂载: "
                             f"{host_path} → /workspace/extra/{c_path}"
@@ -245,6 +268,7 @@ def nanoclaw_register_group(
             conn.commit()
         finally:
             conn.close()
+        _write_chat_config(folder, jid)
     except sqlite3.IntegrityError as e:
         err = str(e)
         if "UNIQUE constraint failed: registered_groups.jid" in err:
