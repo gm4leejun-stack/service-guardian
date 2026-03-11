@@ -8,23 +8,19 @@ Benefits over v1 (LangGraph):
 - No recursion limits (no GraphRecursionError, no step-limit self-healing)
 - No history corruption (no _trim_state, no orphaned tool_result)
 - Claude Code uses Bash natively — no custom tool wrappers needed
-- Session persistence via --resume flag (sessions.json per thread_id)
-- Simpler codebase: no Tier-0/1/2 self-healing, no SqliteSaver
+- No session accumulation: each task is a fresh invocation — context comes from
+  CLAUDE.md + the task description, not a growing conversation history.
+  This keeps every request fast regardless of prior usage.
 
 notify_user: Claude Code calls notify_cli.py via Bash:
     python3 /path/to/notify_cli.py "message" <chat_id>
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
-import threading
-import time
 from pathlib import Path
-
-SESSION_MAX_AGE = 4 * 3600  # 4 hours — prevents stale/bloated sessions
 
 from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
 
@@ -32,47 +28,6 @@ logger = logging.getLogger(__name__)
 
 _SUPERVISOR_DIR = str(Path(__file__).parent.parent)
 _CLAUDE_BIN = str(Path.home() / ".local/bin/claude")
-_SESSIONS_FILE = str(Path(__file__).parent / "sessions.json")
-_sessions_lock = threading.Lock()
-
-
-def _load_sessions() -> dict:
-    try:
-        p = Path(_SESSIONS_FILE)
-        if p.exists():
-            return json.loads(p.read_text())
-    except Exception:
-        pass
-    return {}
-
-
-def _get_session_id(sessions: dict, thread_id: str) -> str | None:
-    """Return session_id only if it exists and is within SESSION_MAX_AGE."""
-    entry = sessions.get(thread_id)
-    if not entry:
-        return None
-    if isinstance(entry, dict):
-        session_id = entry.get("id")
-        created_at = entry.get("created_at", 0)
-        if time.time() - created_at > SESSION_MAX_AGE:
-            logger.info("[brain] Session for thread %s expired (age > %dh), starting fresh",
-                        thread_id, SESSION_MAX_AGE // 3600)
-            return None
-        return session_id
-    # Legacy format: plain string session_id (no age info → treat as valid)
-    return entry
-
-
-def _set_session(sessions: dict, thread_id: str, session_id: str) -> dict:
-    sessions[thread_id] = {"id": session_id, "created_at": time.time()}
-    return sessions
-
-
-def _save_sessions(sessions: dict) -> None:
-    try:
-        Path(_SESSIONS_FILE).write_text(json.dumps(sessions, indent=2))
-    except Exception as e:
-        logger.warning("[brain] Failed to save sessions: %s", e)
 
 
 def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
@@ -85,22 +40,11 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         )
     full_task = task + notify_hint
 
-    # Session continuity: resume previous conversation for this thread
-    with _sessions_lock:
-        sessions = _load_sessions()
-        session_id = _get_session_id(sessions, thread_id)
-        if not session_id and sessions.get(thread_id):
-            # Expired — clear it
-            sessions.pop(thread_id, None)
-            _save_sessions(sessions)
-
     env = dict(os.environ)
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
 
     cmd = [_CLAUDE_BIN, "--print", "--dangerously-skip-permissions"]
-    if session_id:
-        cmd += ["--resume", session_id]
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
     try:
@@ -122,12 +66,6 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         if result.returncode != 0:
             err = stderr[:500] if stderr else stdout[:500] or "(no output)"
             logger.error("[brain] claude error rc=%d: %s", result.returncode, err)
-            if session_id and ("session" in err.lower() or "resume" in err.lower()):
-                logger.info("[brain] Clearing stale session for thread %s", thread_id)
-                with _sessions_lock:
-                    sessions = _load_sessions()
-                    sessions.pop(thread_id, None)
-                    _save_sessions(sessions)
             return f"❌ 执行出错: {err}"
 
         return stdout or "(empty response)"
