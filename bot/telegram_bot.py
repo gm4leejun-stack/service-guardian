@@ -78,14 +78,25 @@ async def _run_agent_and_reply(update: Update, task: str) -> None:
         logger.warning("Could not send thinking indicator: %s", e)
 
     try:
-        # Run agent in thread pool (it's blocking)
+        # Run agent in thread pool (it's blocking).
+        # asyncio.wait_for ensures the event loop unblocks even if the thread hangs
+        # (brain.py has its own 600s subprocess timeout; this is a belt-and-suspenders).
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: run_agent(task, chat_id=chat_id, thread_id=str(chat_id))
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: run_agent(task, chat_id=chat_id, thread_id=str(chat_id))
+            ),
+            timeout=720,  # 12 min > brain's 10 min subprocess timeout
         )
         if result:
             await send_reply(update, result)
+    except asyncio.TimeoutError:
+        logger.error("Executor timeout (720s) for chat %s task: %s", chat_id, task[:60])
+        try:
+            await update.message.reply_text("❌ 任务超时，请重试")
+        except Exception:
+            pass
     except Exception as e:
         logger.exception("Agent error for task: %s", task)
         try:

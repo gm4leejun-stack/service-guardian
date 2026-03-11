@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import threading
 from collections import deque
@@ -90,22 +91,36 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
     try:
-        result = subprocess.run(
+        # start_new_session=True: claude and all its children form a new process group.
+        # On timeout, os.killpg kills the whole group, guaranteeing pipe EOF and no stuck communicate().
+        proc = subprocess.Popen(
             cmd,
-            input=full_task,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=600,
             cwd=_SUPERVISOR_DIR,
             env=env,
+            start_new_session=True,
         )
+        try:
+            stdout_data, stderr_data = proc.communicate(input=full_task, timeout=600)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()  # drain pipes after kill
+            logger.error("[brain] timeout after 600s for thread %s", thread_id)
+            return "❌ 执行超时（10分钟），请稍后重试"
 
-        stderr = (result.stderr or "").strip()
+        result_returncode = proc.returncode
+        stderr = (stderr_data or "").strip()
 
         # stream-json: extract final assistant text from JSON lines
         stdout = ""
         tool_call_count = 0
-        for line in (result.stdout or "").splitlines():
+        for line in (stdout_data or "").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -125,11 +140,11 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
                 pass
 
         logger.info("[brain] claude rc=%d tool_calls=%d stdout_len=%d",
-                    result.returncode, tool_call_count, len(stdout))
+                    result_returncode, tool_call_count, len(stdout))
 
-        if result.returncode != 0:
+        if result_returncode != 0:
             err = stderr[:500] if stderr else stdout[:500] or "(no output)"
-            logger.error("[brain] claude error rc=%d: %s", result.returncode, err)
+            logger.error("[brain] claude error rc=%d: %s", result_returncode, err)
             return f"❌ 执行出错: {err}"
 
         # Save to history on success
@@ -139,7 +154,8 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         return stdout or "(empty response)"
 
     except subprocess.TimeoutExpired:
-        logger.error("[brain] timeout after 600s for thread %s", thread_id)
+        # Fallback: should not reach here since we handle TimeoutExpired above
+        logger.error("[brain] timeout (fallback) for thread %s", thread_id)
         return "❌ 执行超时（10分钟），请稍后重试"
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
