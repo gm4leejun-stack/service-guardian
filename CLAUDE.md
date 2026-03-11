@@ -118,6 +118,9 @@ launchctl list com.ai-supervisor | grep PID
 - 完成一个完整的新功能
 - 用户明确要求提交
 
+提交前必须检查：改动是否影响架构、使用方式、配置项、恢复流程？
+**如果是，先更新 README.md，再一起提交。**
+
 ```bash
 git add <修改的文件>
 git commit -m "<简洁描述>"
