@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
+
+HEARTBEAT_FILE = Path(__file__).parent.parent / "logs" / "bot_heartbeat.txt"
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -412,6 +415,17 @@ def main() -> None:
         loop = asyncio.get_event_loop()
         notify_tools.setup(application.bot, loop)
         logger.info("Bot instance injected into notify_tools")
+
+        async def _heartbeat_loop() -> None:
+            while True:
+                try:
+                    HEARTBEAT_FILE.write_text(str(time.time()))
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+
+        asyncio.create_task(_heartbeat_loop())
+        logger.info("Bot heartbeat task started → %s", HEARTBEAT_FILE)
 
         from telegram import BotCommand
         await application.bot.set_my_commands([

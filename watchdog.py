@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 # OpenClaw's own Telegram bot token (for pending update check)
 OPENCLAW_BOT_TOKEN = "8397885859:AAHwmhMbyUu8cRcG_vdIkb-PG7TUGMt21xU"
 
+# Bot heartbeat file written by telegram_bot.py every 30s
+BOT_HEARTBEAT_FILE = str(Path(__file__).parent / "logs" / "bot_heartbeat.txt")
+BOT_HEARTBEAT_THRESHOLD = 300  # 5 minutes — bot polling thread is dead
+
 # Per-service rescue cooldown in seconds (60 minutes)
 RESCUE_COOLDOWN = 3600
 _last_rescue: dict[str, float] = {}
@@ -244,6 +248,31 @@ def _trigger_agent_rescue(service_key: str, description: str, health: dict) -> N
             logger.exception("[watchdog] Fallback restart error: %s", e2)
 
 
+def check_bot_health() -> dict:
+    """Check if the Telegram bot polling thread is alive via heartbeat file."""
+    age = _log_age_seconds(BOT_HEARTBEAT_FILE)
+    if age is None:
+        # File doesn't exist yet (first run after deploy) — skip
+        return {"service": "bot", "running": True, "frozen": False,
+                "message": "Bot heartbeat 文件不存在，跳过（首次启动）"}
+    if age > BOT_HEARTBEAT_THRESHOLD:
+        return {"service": "bot", "running": True, "frozen": True,
+                "message": f"Bot 轮询线程已挂（心跳陈旧 {age:.0f}s）"}
+    return {"service": "bot", "running": True, "frozen": False,
+            "message": f"Bot 心跳正常（{age:.0f}s 前更新）"}
+
+
+def _restart_self() -> None:
+    """Restart ai-supervisor via launchctl. This process will be killed."""
+    import subprocess
+    logger.warning("[watchdog] Bot thread dead — restarting com.ai-supervisor via launchctl")
+    subprocess.Popen(
+        ["/bin/launchctl", "stop", "com.ai-supervisor"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # launchctl will restart us automatically (OnDemand=false / KeepAlive=true)
+
+
 def run_watchdog_once() -> list[dict]:
     results = []
     for svc in SERVICES_TO_WATCH:
@@ -259,6 +288,18 @@ def run_watchdog_once() -> list[dict]:
                 "service": svc["key"], "running": None, "frozen": None,
                 "log_age": None, "message": f"检查出错: {e}",
             })
+
+    # Check bot polling thread health via heartbeat file
+    try:
+        bot_r = check_bot_health()
+        results.append(bot_r)
+        logger.info("[watchdog] %s", bot_r["message"])
+        if bot_r.get("frozen") and not _in_cooldown("bot"):
+            _last_rescue["bot"] = time.time()
+            _restart_self()
+    except Exception as e:
+        logger.exception("[watchdog] Error checking bot health: %s", e)
+
     return results
 
 
