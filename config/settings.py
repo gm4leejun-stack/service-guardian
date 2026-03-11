@@ -53,3 +53,7 @@ WATCHDOG_QUIET_HOURS_END = 8     # 8:00
 
 # LangGraph
 LANGGRAPH_RECURSION_LIMIT = 100
+
+# Mac Exec Bridge (lets NanoClaw containers run Mac commands via host.docker.internal)
+EXEC_BRIDGE_PORT = int(os.environ.get("EXEC_BRIDGE_PORT", "18800"))
+EXEC_BRIDGE_TOKEN = os.environ.get("EXEC_BRIDGE_TOKEN", "")

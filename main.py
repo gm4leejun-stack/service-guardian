@@ -65,6 +65,11 @@ def main() -> None:
         # Default: run both
         run_watchdog_background()
 
+    # Mac exec bridge: lets NanoClaw containers run Mac commands via host.docker.internal
+    from config.settings import EXEC_BRIDGE_PORT, EXEC_BRIDGE_TOKEN
+    from tools.exec_bridge import start_bridge
+    start_bridge(EXEC_BRIDGE_PORT, EXEC_BRIDGE_TOKEN)
+
     logger.info("Starting Telegram bot (Agent mode)")
     run_bot()
 

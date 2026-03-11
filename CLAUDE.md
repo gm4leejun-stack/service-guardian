@@ -25,6 +25,28 @@
 - **挂载配置**: `~/.config/nanoclaw/mount-allowlist.json`
 - **重启**: `launchctl stop com.nanoclaw && sleep 2 && launchctl start com.nanoclaw`
 
+## 执行环境检测
+
+运行 `uname -s` 判断当前环境：
+- 输出 `Darwin` → 在 Mac 上直接运行，可直接使用 `launchctl`、`ps aux` 等 macOS 命令
+- 输出 `Linux` → 在 NanoClaw Docker 容器内，**必须通过 mac_exec_cli.py 执行所有 Mac 命令**
+
+### 在 NanoClaw 容器内执行 Mac 命令
+
+```bash
+# 语法
+python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "<Mac命令>"
+
+# 示例
+python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "launchctl list com.ai-supervisor"
+python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "launchctl stop com.nanoclaw && sleep 2 && launchctl start com.nanoclaw" --timeout 60
+python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "tail -50 ~/.openclaw/logs/gateway.err.log"
+python3 /workspace/extra/ai-supervisor/tools/mac_exec_cli.py "ps aux | grep openclaw"
+```
+
+**在容器内，所有涉及服务管理、日志读取、进程查看的命令都走 mac_exec_cli.py。**
+文件读写（ai-supervisor 目录内）可直接操作挂载路径，无需走桥接。
+
 ## 进度通知
 发送 Telegram 进度通知（每个关键步骤必须发）：
 ```bash
@@ -63,7 +85,7 @@ tail -50 ~/.openclaw/logs/gateway.err.log
 | 错误日志内容 | 行动 |
 |---|---|
 | `model_not_found` / `invalid_model` | 直接查 `~/.openclaw/openclaw.json`，找到错误的模型名，改成可用模型，重启 |
-| `503` / `overloaded` / `rate_limit` | 不重启，告知是 API 问题 |
+| `503` / `overloaded` / `rate_limit` | 1. `cat ~/.openclaw/logs/gateway.err.log` 确认 503 是哪个模型报出来的。2. `openclaw models` 查看当前 Default 模型是哪个。3. 若 Default 模型 = 报 503 的模型：执行 `openclaw model set <另一个无错误的模型别名>` 切换，重启生效。若不匹配（503 是历史遗留）：不改任何配置，告知用户当前默认模型无错误。4. ❌ **严禁直接编辑 openclaw.json**，❌ **严禁删除或移除任何模型**。若是 API 整体不可用，不重启不改配置，告知用户 |
 | **无错误** + 主日志长时间无内容 | 才考虑进程冻结：检查 Telegram pending 消息数 |
 
 ❌ **禁止在读错误日志之前就重启或猜测根因。**
