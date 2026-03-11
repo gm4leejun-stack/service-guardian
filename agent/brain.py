@@ -4,13 +4,14 @@ agent/brain.py — Claude Code subprocess runner (v2).
 Replaces LangGraph ReAct Agent. Architecture:
     Telegram message → claude --print subprocess → result
 
-Benefits over v1 (LangGraph):
-- No recursion limits (no GraphRecursionError, no step-limit self-healing)
-- No history corruption (no _trim_state, no orphaned tool_result)
-- Claude Code uses Bash natively — no custom tool wrappers needed
-- No session accumulation: each task is a fresh invocation — context comes from
-  CLAUDE.md + the task description, not a growing conversation history.
-  This keeps every request fast regardless of prior usage.
+Session design:
+- No --resume: avoids growing Claude Code session history (tools + results)
+  which causes API slowdown after long usage.
+- Lightweight history: last HISTORY_TURNS (user_msg, assistant_response) pairs
+  stored in memory, injected as plain text context. Gives conversational
+  continuity without accumulating intermediate tool-call overhead.
+- History is per thread_id, in-memory only (cleared on service restart).
+  Watchdog tasks (thread_id starts with "watchdog_") skip history entirely.
 
 notify_user: Claude Code calls notify_cli.py via Bash:
     python3 /path/to/notify_cli.py "message" <chat_id>
@@ -20,6 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
+from collections import deque
 from pathlib import Path
 
 from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
@@ -29,8 +32,38 @@ logger = logging.getLogger(__name__)
 _SUPERVISOR_DIR = str(Path(__file__).parent.parent)
 _CLAUDE_BIN = str(Path.home() / ".local/bin/claude")
 
+# Conversational history: keep last N user/response pairs per thread
+HISTORY_TURNS = 5
+_history: dict[str, deque] = {}   # thread_id → deque of (user_msg, assistant_resp)
+_history_lock = threading.Lock()
+
+
+def _get_history_context(thread_id: str) -> str:
+    with _history_lock:
+        turns = list(_history.get(thread_id, []))
+    if not turns:
+        return ""
+    lines = ["[最近对话记录（供参考）]"]
+    for user_msg, assistant_resp in turns:
+        lines.append(f"用户: {user_msg[:300]}")
+        lines.append(f"助手: {assistant_resp[:600]}")
+        lines.append("")
+    return "\n".join(lines) + "\n---\n\n"
+
+
+def _save_history(thread_id: str, user_msg: str, assistant_resp: str) -> None:
+    with _history_lock:
+        if thread_id not in _history:
+            _history[thread_id] = deque(maxlen=HISTORY_TURNS)
+        _history[thread_id].append((user_msg, assistant_resp))
+
 
 def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
+    is_watchdog = thread_id.startswith("watchdog")
+
+    # Inject conversational history (skip for watchdog autonomous tasks)
+    history_ctx = "" if is_watchdog else _get_history_context(thread_id)
+
     # Inject chat_id so Claude Code can call notify_cli.py for progress updates
     notify_hint = ""
     if chat_id:
@@ -38,7 +71,8 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             f"\n\n[进度通知命令: python3 {_SUPERVISOR_DIR}/tools/notify_cli.py '消息内容' {chat_id}]"
             f"\n[规则：进度通知命令只用于执行中的中间步骤通知。最终结果必须且只能通过 stdout 输出，不得再用进度通知命令发送最终汇总，否则用户会收到重复消息。]"
         )
-    full_task = task + notify_hint
+
+    full_task = history_ctx + task + notify_hint
 
     env = dict(os.environ)
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
@@ -67,6 +101,10 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             err = stderr[:500] if stderr else stdout[:500] or "(no output)"
             logger.error("[brain] claude error rc=%d: %s", result.returncode, err)
             return f"❌ 执行出错: {err}"
+
+        # Save to history on success
+        if not is_watchdog and stdout:
+            _save_history(thread_id, task, stdout)
 
         return stdout or "(empty response)"
 
