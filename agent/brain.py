@@ -21,7 +21,10 @@ import logging
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
+
+SESSION_MAX_AGE = 4 * 3600  # 4 hours — prevents stale/bloated sessions
 
 from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
 
@@ -41,6 +44,28 @@ def _load_sessions() -> dict:
     except Exception:
         pass
     return {}
+
+
+def _get_session_id(sessions: dict, thread_id: str) -> str | None:
+    """Return session_id only if it exists and is within SESSION_MAX_AGE."""
+    entry = sessions.get(thread_id)
+    if not entry:
+        return None
+    if isinstance(entry, dict):
+        session_id = entry.get("id")
+        created_at = entry.get("created_at", 0)
+        if time.time() - created_at > SESSION_MAX_AGE:
+            logger.info("[brain] Session for thread %s expired (age > %dh), starting fresh",
+                        thread_id, SESSION_MAX_AGE // 3600)
+            return None
+        return session_id
+    # Legacy format: plain string session_id (no age info → treat as valid)
+    return entry
+
+
+def _set_session(sessions: dict, thread_id: str, session_id: str) -> dict:
+    sessions[thread_id] = {"id": session_id, "created_at": time.time()}
+    return sessions
 
 
 def _save_sessions(sessions: dict) -> None:
@@ -63,7 +88,11 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
     # Session continuity: resume previous conversation for this thread
     with _sessions_lock:
         sessions = _load_sessions()
-        session_id = sessions.get(thread_id)
+        session_id = _get_session_id(sessions, thread_id)
+        if not session_id and sessions.get(thread_id):
+            # Expired — clear it
+            sessions.pop(thread_id, None)
+            _save_sessions(sessions)
 
     env = dict(os.environ)
     env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
@@ -80,7 +109,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             input=full_task,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=600,
             cwd=_SUPERVISOR_DIR,
             env=env,
         )
@@ -104,15 +133,8 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         return stdout or "(empty response)"
 
     except subprocess.TimeoutExpired:
-        logger.error("[brain] timeout after 120s for thread %s, clearing session", thread_id)
-        # Clear stale session so next request starts fresh
-        with _sessions_lock:
-            sessions = _load_sessions()
-            if thread_id in sessions:
-                sessions.pop(thread_id)
-                _save_sessions(sessions)
-                logger.info("[brain] Stale session cleared for thread %s", thread_id)
-        return "❌ 执行超时（2分钟），已清除历史会话，请重新发送请求"
+        logger.error("[brain] timeout after 600s for thread %s", thread_id)
+        return "❌ 执行超时（10分钟），请稍后重试"
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
         return f"❌ 执行出错: {e}"
