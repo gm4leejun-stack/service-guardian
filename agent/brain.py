@@ -84,6 +84,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         "--no-session-persistence",
         "--max-budget-usd", "1.00",
         "--output-format", "stream-json",
+        "--verbose",
         "--debug-file", _debug_log,
     ]
 
