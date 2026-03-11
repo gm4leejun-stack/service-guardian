@@ -21,11 +21,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 log_dir = Path(__file__).parent / "logs"
 log_dir.mkdir(exist_ok=True)
 
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(str(log_dir / "supervisor.log")),
+        RotatingFileHandler(
+            str(log_dir / "supervisor.log"),
+            maxBytes=5 * 1024 * 1024,  # 5MB per file
+            backupCount=3,             # keep supervisor.log + 3 backups = 20MB max
+        ),
         logging.StreamHandler(),
     ],
 )

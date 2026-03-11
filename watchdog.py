@@ -293,10 +293,13 @@ def run_watchdog_once() -> list[dict]:
     try:
         bot_r = check_bot_health()
         results.append(bot_r)
-        logger.info("[watchdog] %s", bot_r["message"])
-        if bot_r.get("frozen") and not _in_cooldown("bot"):
-            _last_rescue["bot"] = time.time()
-            _restart_self()
+        if bot_r.get("frozen"):
+            logger.warning("[watchdog] %s", bot_r["message"])
+            if not _in_cooldown("bot"):
+                _last_rescue["bot"] = time.time()
+                _restart_self()
+        else:
+            logger.debug("[watchdog] %s", bot_r["message"])  # healthy = debug only, no log spam
     except Exception as e:
         logger.exception("[watchdog] Error checking bot health: %s", e)
 
