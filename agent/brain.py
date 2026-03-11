@@ -80,7 +80,7 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
             input=full_task,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=120,
             cwd=_SUPERVISOR_DIR,
             env=env,
         )
@@ -104,8 +104,15 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         return stdout or "(empty response)"
 
     except subprocess.TimeoutExpired:
-        logger.error("[brain] timeout after 600s for thread %s", thread_id)
-        return "❌ 执行超时（10分钟），请稍后重试"
+        logger.error("[brain] timeout after 120s for thread %s, clearing session", thread_id)
+        # Clear stale session so next request starts fresh
+        with _sessions_lock:
+            sessions = _load_sessions()
+            if thread_id in sessions:
+                sessions.pop(thread_id)
+                _save_sessions(sessions)
+                logger.info("[brain] Stale session cleared for thread %s", thread_id)
+        return "❌ 执行超时（2分钟），已清除历史会话，请重新发送请求"
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
         return f"❌ 执行出错: {e}"
