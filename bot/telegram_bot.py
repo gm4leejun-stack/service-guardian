@@ -415,7 +415,15 @@ def main() -> None:
 
     logger.info("Starting AI Supervisor Telegram bot (Agent mode)...")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        # Set explicit read/connect timeouts for getUpdates to prevent
+        # TCP-level hangs that freeze the polling loop indefinitely.
+        .get_updates_request(HTTPXRequest(read_timeout=30, connect_timeout=15))
+        .build()
+    )
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
