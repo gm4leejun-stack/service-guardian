@@ -2,10 +2,10 @@
 watchdog.py — monitors OpenClaw/NanoClaw for real freezes.
 
 Freeze definition (per service):
-  OpenClaw: process running + log stale > threshold + Telegram has pending
-            updates (messages queued but not processed)
-  NanoClaw: process NOT running (crash/stop) — log staleness alone is not
-            a reliable signal since NanoClaw may be idle
+  Both OpenClaw and NanoClaw: process running + log stale > threshold.
+  Telegram pending count is collected for triage context but does NOT
+  gate the rescue — a stale socket means pending stays 0 even when broken.
+  Process-down is also treated as frozen to trigger rescue.
 
 Smart Triage: when an anomaly signal is detected, one cheap LLM call
 confirms whether it's a real incident before launching the full ReAct
@@ -44,8 +44,9 @@ from tools.service_tools import get_service_status, restart_service
 
 logger = logging.getLogger(__name__)
 
-# OpenClaw's own Telegram bot token (for pending update check)
+# Telegram bot tokens (for pending update check)
 OPENCLAW_BOT_TOKEN = "8397885859:AAHwmhMbyUu8cRcG_vdIkb-PG7TUGMt21xU"
+NANOCLAW_BOT_TOKEN = "8328203583:AAGMjtJKTihd7acVkpYACK6mxBp7o6ldkJY"
 
 # Bot heartbeat file written by telegram_bot.py every 30s
 BOT_HEARTBEAT_FILE = str(Path(__file__).parent / "logs" / "bot_heartbeat.txt")
@@ -66,7 +67,10 @@ SERVICES_TO_WATCH = [
         "key": "nanoclaw",
         "log": str(Path.home() / "nanoclaw/logs/nanoclaw.log"),
         "description": "NanoClaw",
+        # NanoClaw only writes logs when handling messages; idle silence is normal.
+        # Freeze detection: process must be DOWN (not log-stale).
         "freeze_check": "process_down",
+        "bot_token": NANOCLAW_BOT_TOKEN,
     },
 ]
 
@@ -118,30 +122,21 @@ def check_service_health(service_config: dict) -> dict:
     status = get_service_status(key)
     running = status.get("running", False)
 
-    # --- NanoClaw: only care if it crashes ---
-    if freeze_check == "process_down":
-        if not running:
-            logger.warning("[watchdog] %s is DOWN", desc)
-            return {
-                "service": key, "running": False, "frozen": True,
-                "log_age": None,
-                "message": f"{desc} 进程已停止，需要重启",
-            }
-        logger.debug("[watchdog] %s running (PID=%s)", desc, status.get("pid"))
-        return {
-            "service": key, "running": True, "frozen": False,
-            "log_age": _log_age_seconds(log_path),
-            "message": f"{desc} 运行正常（PID={status.get('pid')}）",
-        }
-
-    # --- OpenClaw: frozen = running + log stale + Telegram has pending msgs ---
     if not running:
         logger.warning("[watchdog] %s is NOT running", desc)
         return {
-            "service": key, "running": False, "frozen": False,
+            "service": key, "running": False, "frozen": True,
             "log_age": None,
-            "message": f"{desc} 未运行（可能已被手动停止）",
+            "message": f"{desc} 进程已停止，需要重启",
         }
+
+    # process_down mode: only flag if process is not running (log silence is normal)
+    if freeze_check == "process_down":
+        age = _log_age_seconds(log_path)
+        msg = (f"{desc} 健康（进程存活，日志更新于 {age:.0f}s 前）"
+               if age is not None else f"{desc} 健康（进程存活）")
+        logger.debug("[watchdog] %s", msg)
+        return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
 
     age = _log_age_seconds(log_path)
     if age is None or age <= WATCHDOG_FREEZE_THRESHOLD:
@@ -150,27 +145,20 @@ def check_service_health(service_config: dict) -> dict:
         logger.debug("[watchdog] %s", msg)
         return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
 
-    # Log is stale — check if Telegram actually has queued messages
-    pending = _get_telegram_pending(OPENCLAW_BOT_TOKEN)
-    if pending is None:
-        logger.info("[watchdog] %s log stale (%.0fs) but Telegram check failed — skipping", desc, age)
-        return {
-            "service": key, "running": True, "frozen": False, "log_age": age,
-            "message": f"{desc} 日志陈旧 {age:.0f}s，无法确认冻结（Telegram API 不可达）",
-        }
+    # Log is stale — treat as frozen regardless of Telegram pending count.
+    # Rationale: a stale socket means Telegram never delivers messages,
+    # so pending stays 0 even though the service is actually broken.
+    # We still fetch pending for the triage context message, but it no
+    # longer gates whether we trigger a rescue.
+    bot_token = service_config.get("bot_token", OPENCLAW_BOT_TOKEN)
+    pending = _get_telegram_pending(bot_token)
+    pending_info = f"Telegram 积压 {pending} 条" if pending else "Telegram 积压 0 条（可能是 stale socket）"
 
-    if pending == 0:
-        logger.info("[watchdog] %s log stale (%.0fs) but no pending msgs — idle", desc, age)
-        return {
-            "service": key, "running": True, "frozen": False, "log_age": age,
-            "message": f"{desc} 空闲（日志 {age:.0f}s 未更新，Telegram 无积压消息）",
-        }
-
-    logger.warning("[watchdog] %s FROZEN: log stale %.0fs + %d pending Telegram msgs",
-                   desc, age, pending)
+    logger.warning("[watchdog] %s FROZEN: log stale %.0fs (%s)",
+                   desc, age, pending_info)
     return {
         "service": key, "running": True, "frozen": True, "log_age": age,
-        "message": f"{desc} 冻结（日志 {age:.0f}s 未更新，Telegram 积压 {pending} 条消息）",
+        "message": f"{desc} 冻结（日志 {age:.0f}s 未更新，{pending_info}）",
     }
 
 
