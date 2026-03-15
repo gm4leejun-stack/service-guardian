@@ -61,7 +61,9 @@ SERVICES_TO_WATCH = [
         "key": "openclaw",
         "log": OPENCLAW_LOG,
         "description": "OpenClaw Gateway",
-        "freeze_check": "telegram_pending",
+        # OpenClaw only writes logs during activity; idle silence (30min health-monitor cycles)
+        # is normal. Freeze detection: process must be DOWN (not log-stale).
+        "freeze_check": "process_down",
     },
     {
         "key": "nanoclaw",
