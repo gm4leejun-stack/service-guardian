@@ -434,14 +434,35 @@ async def cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     def _fmt(n: int) -> str:
         return f"{n/1000:.1f}K" if n >= 1000 else str(n)
 
+    def _pct(n: int) -> str:
+        return f"{int(n * 100 / input_total)}%" if input_total > 0 else "0%"
+
+    def _est(chars: int) -> int:
+        """Rough chars→tokens estimate for mixed CJK/English."""
+        return max(0, chars // 3)
+
+    hist_tok  = _est(usage_record.get("_history_chars", 0))
+    md_tok    = _est(usage_record.get("_claude_md_chars", 0))
+    other_tok = max(0, input_total - hist_tok - md_tok)
+
+    model    = usage_record.get("_model", "unknown")
+    time_str = usage_record.get("_time", "")
+
     lines = [
-        "📊 上次 Token 用量分析",
+        "📥 上次 Input 构成分析",
+        f"🕐 {time_str}",
+        f"🤖 {model}",
         "",
-        f"输入合计：{_fmt(input_total)}",
-        f"  ├ 直接输入：{_fmt(input_tokens)}",
-        f"  ├ 缓存创建：{_fmt(cache_create)}",
-        f"  └ 缓存命中：{_fmt(cache_read)}",
-        f"输出：{_fmt(output_tokens)}",
+        "─────────────────",
+        f"📜 对话历史: ≈{_fmt(hist_tok)} ({_pct(hist_tok)})",
+        f"📋 CLAUDE.md: ≈{_fmt(md_tok)} ({_pct(md_tok)})",
+        f"💬 工具+当前消息: ≈{_fmt(other_tok)} ({_pct(other_tok)})",
+        "─────────────────",
+        f"⬆️ Input 合计: {_fmt(input_total)}",
+        f"  ├ 新鲜处理: {_fmt(input_tokens)}",
+        f"  ├ 缓存命中: {_fmt(cache_read)}",
+        f"  └ 缓存写入: {_fmt(cache_create)}",
+        f"⬇️ Output: {_fmt(output_tokens)}",
     ]
     await update.message.reply_text("\n".join(lines))
 

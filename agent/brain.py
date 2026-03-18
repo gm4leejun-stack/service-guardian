@@ -346,7 +346,28 @@ async def run_agent(
         with _memory_lock:
             working_memory[thread_id].append((task, stdout))
         if usage:
-            last_usage[thread_id] = usage
+            # Measure component sizes for /input breakdown display
+            try:
+                claude_md_chars = sum(
+                    len(p.read_text(encoding="utf-8", errors="ignore"))
+                    for p in [
+                        Path(_SUPERVISOR_DIR) / "CLAUDE.md",
+                        Path.home() / "CLAUDE.md",
+                    ]
+                    if p.exists()
+                )
+            except Exception:
+                claude_md_chars = 0
+            tz = timezone(timedelta(hours=8))
+            last_usage[thread_id] = {
+                **usage,
+                "_time": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S CST"),
+                "_model": settings.CLAUDE_MODEL,
+                "_history_chars": len(history_ctx),
+                "_task_chars": len(task),
+                "_notify_chars": len(notify_hint),
+                "_claude_md_chars": claude_md_chars,
+            }
 
     return (stdout or "(empty response)", usage)
 
