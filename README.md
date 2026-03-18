@@ -1,6 +1,6 @@
-# ai-supervisor (Service Guardian)
+# 龙虾医生（ai-supervisor）
 
-Mac mini 上的本地 DevOps Agent，通过 Telegram 管理 OpenClaw 和 NanoClaw 服务。
+Mac 上的本地 DevOps Agent，通过 Telegram 管理本机的各项服务。
 
 ## 架构
 

@@ -34,7 +34,26 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _SUPERVISOR_DIR = str(Path(__file__).parent.parent)
-_CLAUDE_BIN = str(Path.home() / ".local/bin/claude")
+
+
+def _find_claude_bin() -> str:
+    """Locate the claude CLI binary: PATH first, then common install locations."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    candidates = [
+        Path.home() / ".local/bin/claude",
+        Path("/usr/local/bin/claude"),
+        Path("/opt/homebrew/bin/claude"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return str(Path.home() / ".local/bin/claude")  # fallback, will surface a clear error
+
+
+_CLAUDE_BIN = _find_claude_bin()
 
 # ---------------------------------------------------------------------------
 # Working memory (task-scoped, in-memory only)
