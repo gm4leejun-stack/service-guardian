@@ -46,14 +46,21 @@ if [ ! -f "$ENV_FILE" ]; then
         read -p "   Token (required): " BOT_TOKEN
     done
 
-    # Check if Claude Code is already installed and authenticated
-    CLAUDE_BIN="${HOME}/.local/bin/claude"
+    # Check if Claude Code is already installed AND authenticated
+    CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "${HOME}/.local/bin/claude")
     API_KEY=""
     ANTHROPIC_BASE_URL=""
     CLAUDE_CONFIGURED=false
+    # Claude Code stores credentials in ~/.claude/.credentials.json (OAuth) or uses ANTHROPIC_API_KEY
+    CLAUDE_AUTHED=false
     if [ -f "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+        if [ -f "${HOME}/.claude/.credentials.json" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
+            CLAUDE_AUTHED=true
+        fi
+    fi
+    if [ "$CLAUDE_AUTHED" = true ]; then
         echo ""
-        echo "  ✅ Claude Code detected — skipping API key setup"
+        echo "  ✅ Claude Code detected and authenticated — skipping API key setup"
         CLAUDE_CONFIGURED=true
     else
         # Anthropic API Key
@@ -145,7 +152,7 @@ cat > "$PLIST_DST" <<EOF
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>$HOME</string>
     </dict>
