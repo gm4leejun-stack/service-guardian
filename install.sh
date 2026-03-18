@@ -46,14 +46,26 @@ if [ ! -f "$ENV_FILE" ]; then
         read -p "   Token (required): " BOT_TOKEN
     done
 
-    # Anthropic API Key
-    echo ""
-    echo "2) Anthropic API Key (for Claude)"
-    echo "   → Get it from https://console.anthropic.com"
-    read -p "   API Key: " API_KEY
-    while [ -z "$API_KEY" ]; do
-        read -p "   API Key (required): " API_KEY
-    done
+    # Check if Claude Code is already installed and authenticated
+    CLAUDE_BIN="${HOME}/.local/bin/claude"
+    API_KEY=""
+    ANTHROPIC_BASE_URL=""
+    CLAUDE_CONFIGURED=false
+    if [ -f "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+        echo ""
+        echo "  ✅ Claude Code detected — skipping API key setup"
+        CLAUDE_CONFIGURED=true
+    else
+        # Anthropic API Key
+        echo ""
+        echo "2) Anthropic API Key (for Claude)"
+        echo "   → Get it from https://console.anthropic.com"
+        read -p "   API Key: " API_KEY
+        while [ -z "$API_KEY" ]; do
+            read -p "   API Key (required): " API_KEY
+        done
+        ANTHROPIC_BASE_URL="https://api.anthropic.com"
+    fi
 
     # Optional: machine name
     echo ""
@@ -67,7 +79,7 @@ if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<EOF
 TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 ANTHROPIC_API_KEY=$API_KEY
-ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL
 HAIKU_MODEL=claude-haiku-4-5-20251001
 CLAUDE_MODEL=claude-sonnet-4-6
 ADMIN_CHAT_ID=

@@ -199,8 +199,11 @@ async def generate_summary_with_haiku(thread_id: str) -> str:
 def _run_subprocess(full_task: str, thread_id: str) -> tuple[str, str, int]:
     """Run claude --print subprocess and return (stdout_data, stderr_data, returncode)."""
     env = dict(os.environ)
-    env["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
-    env["ANTHROPIC_BASE_URL"] = settings.ANTHROPIC_BASE_URL
+    # Only override if explicitly configured; otherwise Claude Code uses its own auth
+    if settings.ANTHROPIC_API_KEY:
+        env["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
+    if settings.ANTHROPIC_BASE_URL:
+        env["ANTHROPIC_BASE_URL"] = settings.ANTHROPIC_BASE_URL
 
     _debug_log = str(Path(_SUPERVISOR_DIR) / "logs" / f"claude_debug_{thread_id}.jsonl")
     cmd = [
