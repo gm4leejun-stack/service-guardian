@@ -209,6 +209,7 @@ def _run_subprocess(full_task: str, thread_id: str) -> tuple[str, str, int]:
         "--max-budget-usd", "1.00",
         "--output-format", "stream-json",
         "--verbose",
+        "--setting-sources", "",  # disable plugins/hooks; keeps CLAUDE.md, avoids MCP+hook overhead
         "--debug-file", _debug_log,
     ]
 
