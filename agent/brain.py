@@ -313,6 +313,7 @@ async def run_agent(
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
 
     # --- Run subprocess in thread (blocking) ---
+    _t0 = asyncio.get_event_loop().time()
     try:
         stdout_data, stderr_data, returncode = await asyncio.to_thread(
             _run_subprocess, full_task, thread_id
@@ -323,6 +324,7 @@ async def run_agent(
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
         return (f"❌ 执行出错: {e}", None)
+    _elapsed = asyncio.get_event_loop().time() - _t0
 
     stderr = (stderr_data or "").strip()
     stdout, tool_call_count = _parse_stream_output(stdout_data)
@@ -330,8 +332,9 @@ async def run_agent(
     # Parse usage from stream
     usage = parse_usage_from_stream(stdout_data)
 
-    logger.info("[brain] claude rc=%d tool_calls=%d stdout_len=%d",
-                returncode, tool_call_count, len(stdout))
+    log_fn = logger.warning if _elapsed > 30 else logger.info
+    log_fn("[brain] claude rc=%d tool_calls=%d stdout_len=%d elapsed=%.1fs",
+           returncode, tool_call_count, len(stdout), _elapsed)
 
     if returncode != 0:
         err = stderr[:500] if stderr else stdout[:500] or "(no output)"
