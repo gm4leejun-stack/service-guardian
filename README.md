@@ -31,39 +31,34 @@ Mac Exec Bridge（localhost:18800）
     → Bearer token 认证，仅绑定 127.0.0.1
 ```
 
-## 快速恢复（重装系统后）
+## 安装（一条命令）
 
 ### 1. 克隆项目
 
 ```bash
 git clone https://github.com/gm4leejun-stack/service-guardian.git ~/ai-supervisor
-cd ~/ai-supervisor
 ```
 
-### 2. 创建虚拟环境并安装依赖
-
-```bash
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-```
-
-### 3. 恢复 .env（从密码管理器取回备份）
-
-```
-TELEGRAM_BOT_TOKEN=...
-ANTHROPIC_API_KEY=...
-ANTHROPIC_BASE_URL=https://llmapi.lovbrowser.com
-HAIKU_MODEL=anthropic/claude-haiku-4.5
-ADMIN_CHAT_ID=...
-EXEC_BRIDGE_TOKEN=...
-EXEC_BRIDGE_PORT=18800
-```
-
-### 4. 安装 LaunchAgent（开机自启）
+### 2. 运行安装脚本
 
 ```bash
 bash ~/ai-supervisor/install.sh
-launchctl load ~/Library/LaunchAgents/com.ai-supervisor.plist
+```
+
+脚本会自动：创建 venv、安装依赖、引导填写 2 个 Token、注册开机自启。
+
+### 3. 配置 Watchdog 告警接收人
+
+安装完成后，向你的 Bot 发送 `/myid`，把返回的 chat_id 填入 `.env`：
+
+```
+ADMIN_CHAT_ID=<你的chat_id>
+```
+
+然后重启生效：
+
+```bash
+launchctl stop com.ai-supervisor && launchctl start com.ai-supervisor
 ```
 
 验证：`launchctl list com.ai-supervisor | grep PID`

@@ -467,6 +467,17 @@ async def cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return the caller's chat_id — useful during initial setup to fill ADMIN_CHAT_ID."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"Your chat_id: `{chat_id}`\n\n"
+        f"Fill this into `.env`:\n`ADMIN_CHAT_ID={chat_id}`\n\n"
+        f"Then restart: `launchctl stop com.ai-supervisor && launchctl start com.ai-supervisor`",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_scaffold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_allowed(update):
         return
@@ -531,6 +542,7 @@ def main() -> None:
     app.add_handler(CommandHandler("scaffold", cmd_scaffold))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("input", cmd_input))
+    app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_error_handler(error_handler)
 
@@ -564,6 +576,7 @@ def main() -> None:
             BotCommand("nano",     "NanoClaw 管理：nano <groups|mount|register>"),
             BotCommand("new",      "清空当前对话上下文，开始新任务"),
             BotCommand("input",    "查看上次调用的 Token 用量分析"),
+            BotCommand("myid",     "查看你的 chat_id（初次配置用）"),
             BotCommand("help",     "查看所有命令"),
             BotCommand("start",    "启动 bot"),
         ])
