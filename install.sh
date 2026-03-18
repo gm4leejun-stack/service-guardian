@@ -55,6 +55,12 @@ if [ ! -f "$ENV_FILE" ]; then
         read -p "   API Key (required): " API_KEY
     done
 
+    # Optional: machine name
+    echo ""
+    echo "3) Machine name (shown in agent context, optional)"
+    echo "   Example: Mac mini, MacBook Pro"
+    read -p "   Name [skip]: " MACHINE_NAME
+
     # Auto-generate EXEC_BRIDGE_TOKEN
     BRIDGE_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 
@@ -65,6 +71,8 @@ ANTHROPIC_BASE_URL=https://api.anthropic.com
 HAIKU_MODEL=claude-haiku-4-5-20251001
 CLAUDE_MODEL=claude-sonnet-4-6
 ADMIN_CHAT_ID=
+MACHINE_NAME=$MACHINE_NAME
+GITHUB_REPO=
 EXEC_BRIDGE_TOKEN=$BRIDGE_TOKEN
 EXEC_BRIDGE_PORT=18800
 EOF

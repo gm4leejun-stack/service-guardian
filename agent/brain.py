@@ -308,7 +308,20 @@ async def run_agent(
             f"\n[规则：进度通知命令只用于执行中的中间步骤通知。最终结果必须且只能通过 stdout 输出，不得再用进度通知命令发送最终汇总，否则用户会收到重复消息。]"
         )
 
-    full_task = history_ctx + task + notify_hint
+    # --- Dynamic environment context (prepended to task) ---
+    import socket
+    env_lines = [
+        f"主机名: {socket.gethostname()}",
+        f"项目目录: {_SUPERVISOR_DIR}",
+        f"服务名: com.ai-supervisor",
+    ]
+    if settings.MACHINE_NAME:
+        env_lines.insert(0, f"机器: {settings.MACHINE_NAME}")
+    if settings.GITHUB_REPO:
+        env_lines.append(f"GitHub: {settings.GITHUB_REPO}")
+    env_ctx = "[当前环境]\n" + "\n".join(env_lines) + "\n\n"
+
+    full_task = env_ctx + history_ctx + task + notify_hint
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
 

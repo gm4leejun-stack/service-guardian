@@ -29,6 +29,10 @@ ADMIN_CHAT_ID: int | None = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR.isdigit(
 # Allowed Telegram user IDs (empty = allow all)
 ALLOWED_USERS: list[int] = []
 
+# Machine identity (injected into agent system prompt at runtime)
+MACHINE_NAME = os.environ.get("MACHINE_NAME", "")          # e.g. "Mac mini"
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")            # e.g. "https://github.com/..."
+
 # OpenClaw
 OPENCLAW_SERVICE = "ai.openclaw.gateway"
 NANOCLAW_SERVICE = "com.nanoclaw"
