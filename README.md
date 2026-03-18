@@ -45,7 +45,10 @@ git clone https://github.com/gm4leejun-stack/service-guardian.git ~/ai-superviso
 bash ~/ai-supervisor/install.sh
 ```
 
-脚本会自动：创建 venv、安装依赖、引导填写 2 个 Token、注册开机自启。
+脚本会自动：创建 venv、安装依赖、引导配置、注册开机自启。
+
+- 已安装 Claude Code：只需填 **Telegram Bot Token**
+- 未安装 Claude Code：还需填 **Anthropic API Key**
 
 ### 3. 配置 Watchdog 告警接收人
 
