@@ -11,3 +11,5 @@ com.ai-supervisor.plist
 *.egg-info/
 dist/
 build/
+agent/memory.json
+agent/sessions.json

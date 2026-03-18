@@ -1,83 +1,206 @@
 """
-agent/brain.py — Claude Code subprocess runner (v2).
+agent/brain.py — Claude Code subprocess runner (v3 Step 1).
 
 Replaces LangGraph ReAct Agent. Architecture:
     Telegram message → claude --print subprocess → result
 
-Session design:
-- No --resume: avoids growing Claude Code session history (tools + results)
-  which causes API slowdown after long usage.
-- Lightweight history: last HISTORY_TURNS (user_msg, assistant_response) pairs
-  stored in memory, injected as plain text context. Gives conversational
-  continuity without accumulating intermediate tool-call overhead.
-- History is per thread_id, in-memory only (cleared on service restart).
-  Watchdog tasks (thread_id starts with "watchdog_") skip history entirely.
+Session design (v3):
+- Working memory: full task history, MAX_TASK_TURNS=20 safety cap per thread.
+  Cleared when user signals task completion (keyword-based detection).
+- Long-term memory: agent/memory.json, last 50 records, restart-persistent.
+  10 most recent records for the thread injected at task start.
+- Watchdog tasks (thread_id starts with "watchdog_") skip all memory entirely.
 
 notify_user: Claude Code calls notify_cli.py via Bash:
     python3 /path/to/notify_cli.py "message" <chat_id>
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import signal
 import subprocess
 import threading
-from collections import deque
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from config.settings import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
+import anthropic
+
+from config import settings
 
 logger = logging.getLogger(__name__)
 
 _SUPERVISOR_DIR = str(Path(__file__).parent.parent)
 _CLAUDE_BIN = str(Path.home() / ".local/bin/claude")
 
-# Conversational history: keep last N user/response pairs per thread
-HISTORY_TURNS = 5
-_history: dict[str, deque] = {}   # thread_id → deque of (user_msg, assistant_resp)
-_history_lock = threading.Lock()
+# ---------------------------------------------------------------------------
+# Working memory (task-scoped, in-memory only)
+# ---------------------------------------------------------------------------
+
+MAX_TASK_TURNS = 20
+
+# key = thread_id (str(chat_id))
+# value = list of (user_msg, assistant_response) pairs
+working_memory: dict[str, list[tuple[str, str]]] = defaultdict(list)
+
+# Token usage records per thread
+last_usage: dict[str, dict] = {}
+
+# Lock for working_memory and last_usage (accessed from threads and async context)
+_memory_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Long-term memory (agent/memory.json, restart-persistent)
+# ---------------------------------------------------------------------------
+
+MEMORY_PATH = Path(__file__).parent / "memory.json"
+MAX_LONG_TERM = 50
 
 
-def _get_history_context(thread_id: str) -> str:
-    with _history_lock:
-        turns = list(_history.get(thread_id, []))
-    if not turns:
-        return ""
-    lines = ["[最近对话记录（供参考）]"]
-    for user_msg, assistant_resp in turns:
-        lines.append(f"用户: {user_msg[:300]}")
-        lines.append(f"助手: {assistant_resp[:600]}")
+def load_long_term_memory(thread_id: str) -> list[dict]:
+    """Return the 10 most recent long-term memory records for this thread."""
+    if not MEMORY_PATH.exists():
+        return []
+    try:
+        records = json.loads(MEMORY_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    matches = [r for r in records if r.get("thread_id") == thread_id]
+    return matches[-10:]
+
+
+def save_long_term_memory(thread_id: str, summary: str, service: str = "") -> None:
+    """Append a summary record to long-term memory, keeping at most MAX_LONG_TERM."""
+    try:
+        records = json.loads(MEMORY_PATH.read_text()) if MEMORY_PATH.exists() else []
+    except (json.JSONDecodeError, OSError):
+        records = []
+    tz = timezone(timedelta(hours=8))
+    records.append({
+        "time": datetime.now(tz).isoformat(),
+        "thread_id": thread_id,
+        "service": service,
+        "summary": summary,
+    })
+    records = records[-MAX_LONG_TERM:]
+    MEMORY_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Clear-trigger detection
+# ---------------------------------------------------------------------------
+
+RESET_EXACT = {"好了", "解决了", "没问题了", "换个话题", "/new"}
+RESET_CONTAINS = ["问题解决了", "已经解决了", "好的谢谢", "完成了"]
+
+
+def should_clear_working_memory(user_msg: str) -> bool:
+    """Return True if the user message signals end of current task."""
+    msg = user_msg.strip()
+    if msg in RESET_EXACT:
+        return True
+    return any(kw in msg for kw in RESET_CONTAINS)
+
+
+# ---------------------------------------------------------------------------
+# Usage parsing
+# ---------------------------------------------------------------------------
+
+def parse_usage_from_stream(output: str) -> dict | None:
+    """从 claude --output-format stream-json 输出中提取最后一个 usage 字段。"""
+    usage = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if "usage" in obj:
+                usage = obj["usage"]
+        except json.JSONDecodeError:
+            continue
+    return usage
+
+
+# ---------------------------------------------------------------------------
+# Context building helpers
+# ---------------------------------------------------------------------------
+
+def _build_history_context(thread_id: str) -> str:
+    """Build a text block with long-term + working memory for prompt injection."""
+    long_term = load_long_term_memory(thread_id)
+    with _memory_lock:
+        working = list(working_memory.get(thread_id, []))
+
+    lines = []
+
+    if long_term:
+        lines.append("[长期记忆（历史任务摘要）]")
+        for rec in long_term:
+            ts = rec.get("time", "")[:16]
+            summary = rec.get("summary", "")
+            lines.append(f"  [{ts}] {summary}")
         lines.append("")
-    return "\n".join(lines) + "\n---\n\n"
+
+    if working:
+        lines.append("[当前任务对话记录]")
+        for user_msg, assistant_resp in working:
+            lines.append(f"用户: {user_msg[:300]}")
+            lines.append(f"助手: {assistant_resp[:600]}")
+            lines.append("")
+
+    if not lines:
+        return ""
+    return "\n".join(lines) + "---\n\n"
 
 
-def _save_history(thread_id: str, user_msg: str, assistant_resp: str) -> None:
-    with _history_lock:
-        if thread_id not in _history:
-            _history[thread_id] = deque(maxlen=HISTORY_TURNS)
-        _history[thread_id].append((user_msg, assistant_resp))
+# ---------------------------------------------------------------------------
+# Haiku summary
+# ---------------------------------------------------------------------------
 
+async def generate_summary_with_haiku(thread_id: str) -> str:
+    """使用 Haiku 为当前工作记忆生成摘要（1~3句）。"""
+    with _memory_lock:
+        history = list(working_memory.get(thread_id, []))
+    if not history:
+        return ""
 
-def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default") -> str:
-    is_watchdog = thread_id.startswith("watchdog")
+    lines = []
+    for user_msg, assistant_resp in history[-5:]:
+        lines.append(f"用户: {user_msg[:200]}")
+        lines.append(f"助手: {assistant_resp[:300]}")
+    conversation = "\n".join(lines)
 
-    # Inject conversational history (skip for watchdog autonomous tasks)
-    history_ctx = "" if is_watchdog else _get_history_context(thread_id)
-
-    # Inject chat_id so Claude Code can call notify_cli.py for progress updates
-    notify_hint = ""
-    if chat_id:
-        notify_hint = (
-            f"\n\n[进度通知命令: python3 {_SUPERVISOR_DIR}/tools/notify_cli.py '消息内容' {chat_id}]"
-            f"\n[规则：进度通知命令只用于执行中的中间步骤通知。最终结果必须且只能通过 stdout 输出，不得再用进度通知命令发送最终汇总，否则用户会收到重复消息。]"
+    client = anthropic.AsyncAnthropic(
+        api_key=settings.ANTHROPIC_API_KEY,
+        base_url=settings.ANTHROPIC_BASE_URL,
+    )
+    try:
+        msg = await client.messages.create(
+            model=settings.HAIKU_MODEL,
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"请用1~3句话总结以下对话的核心内容（中文，简洁）：\n\n{conversation}",
+            }],
         )
+        return msg.content[0].text.strip()
+    except Exception:
+        return f"对话共{len(history)}轮"
 
-    full_task = history_ctx + task + notify_hint
 
+# ---------------------------------------------------------------------------
+# Subprocess runner (sync, called via asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+def _run_subprocess(full_task: str, thread_id: str) -> tuple[str, str, int]:
+    """Run claude --print subprocess and return (stdout_data, stderr_data, returncode)."""
     env = dict(os.environ)
-    env["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-    env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
+    env["ANTHROPIC_API_KEY"] = settings.ANTHROPIC_API_KEY
+    env["ANTHROPIC_BASE_URL"] = settings.ANTHROPIC_BASE_URL
 
     _debug_log = str(Path(_SUPERVISOR_DIR) / "logs" / f"claude_debug_{thread_id}.jsonl")
     cmd = [
@@ -89,79 +212,154 @@ def run_agent(task: str, chat_id: int | None = None, thread_id: str = "default")
         "--debug-file", _debug_log,
     ]
 
-    logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=_SUPERVISOR_DIR,
+        env=env,
+        start_new_session=True,
+    )
     try:
-        # start_new_session=True: claude and all its children form a new process group.
-        # On timeout, os.killpg kills the whole group, guaranteeing pipe EOF and no stuck communicate().
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=_SUPERVISOR_DIR,
-            env=env,
-            start_new_session=True,
-        )
-        try:
-            stdout_data, stderr_data = proc.communicate(input=full_task, timeout=600)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.communicate()  # drain pipes after kill
-            logger.error("[brain] timeout after 600s for thread %s", thread_id)
-            return "❌ 执行超时（10分钟），请稍后重试"
-
-        result_returncode = proc.returncode
-        stderr = (stderr_data or "").strip()
-
-        # stream-json: extract final assistant text from JSON lines
-        stdout = ""
-        tool_call_count = 0
-        for line in (stdout_data or "").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                import json as _json
-                obj = _json.loads(line)
-                if obj.get("type") == "assistant":
-                    for block in obj.get("message", {}).get("content", []):
-                        if block.get("type") == "text":
-                            stdout += block["text"]
-                        elif block.get("type") == "tool_use":
-                            tool_call_count += 1
-                elif obj.get("type") == "result":
-                    if not stdout:
-                        stdout = obj.get("result", "")
-            except Exception:
-                pass
-
-        logger.info("[brain] claude rc=%d tool_calls=%d stdout_len=%d",
-                    result_returncode, tool_call_count, len(stdout))
-
-        if result_returncode != 0:
-            err = stderr[:500] if stderr else stdout[:500] or "(no output)"
-            logger.error("[brain] claude error rc=%d: %s", result_returncode, err)
-            return f"❌ 执行出错: {err}"
-
-        # Save to history on success
-        if not is_watchdog and stdout:
-            _save_history(thread_id, task, stdout)
-
-        return stdout or "(empty response)"
-
+        stdout_data, stderr_data = proc.communicate(input=full_task, timeout=600)
     except subprocess.TimeoutExpired:
-        # Fallback: should not reach here since we handle TimeoutExpired above
-        logger.error("[brain] timeout (fallback) for thread %s", thread_id)
-        return "❌ 执行超时（10分钟），请稍后重试"
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise
+
+    return stdout_data, stderr_data, proc.returncode
+
+
+def _parse_stream_output(stdout_data: str) -> tuple[str, int]:
+    """Parse stream-json output into (text, tool_call_count)."""
+    stdout = ""
+    tool_call_count = 0
+    for line in (stdout_data or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if obj.get("type") == "assistant":
+                for block in obj.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        stdout += block["text"]
+                    elif block.get("type") == "tool_use":
+                        tool_call_count += 1
+            elif obj.get("type") == "result":
+                if not stdout:
+                    stdout = obj.get("result", "")
+        except Exception:
+            pass
+    return stdout, tool_call_count
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def run_agent(
+    task: str,
+    chat_id: int | None = None,
+    thread_id: str = "default",
+) -> tuple[str, dict | None]:
+    """Run the agent for a user task.
+
+    Returns:
+        (response_text, usage_dict) — usage_dict may be None if not available.
+    """
+    is_watchdog = thread_id.startswith("watchdog")
+
+    # --- Clear check (only for human threads) ---
+    if not is_watchdog and should_clear_working_memory(task):
+        summary = await generate_summary_with_haiku(thread_id)
+        if summary:
+            try:
+                save_long_term_memory(thread_id, summary)
+            except Exception as e:
+                logger.warning("Failed to save long-term memory: %s", e)
+        with _memory_lock:
+            working_memory.pop(thread_id, None)
+            last_usage.pop(thread_id, None)
+        logger.info("[brain] Working memory cleared for thread %s", thread_id)
+        return ("✅ 上下文已清除，开始新任务", None)
+
+    # --- MAX_TASK_TURNS guard ---
+    if not is_watchdog:
+        with _memory_lock:
+            turns = len(working_memory.get(thread_id, []))
+        if turns >= MAX_TASK_TURNS:
+            task = task + f"\n\n[注意：当前任务已进行 {turns} 轮，即将达到上限 {MAX_TASK_TURNS} 轮，请尽快完成或总结。]"
+
+    # --- Build context ---
+    history_ctx = "" if is_watchdog else _build_history_context(thread_id)
+
+    # --- notify_hint ---
+    notify_hint = ""
+    if chat_id:
+        notify_hint = (
+            f"\n\n[进度通知命令: python3 {_SUPERVISOR_DIR}/tools/notify_cli.py '消息内容' {chat_id}]"
+            f"\n[规则：进度通知命令只用于执行中的中间步骤通知。最终结果必须且只能通过 stdout 输出，不得再用进度通知命令发送最终汇总，否则用户会收到重复消息。]"
+        )
+
+    full_task = history_ctx + task + notify_hint
+
+    logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
+
+    # --- Run subprocess in thread (blocking) ---
+    try:
+        stdout_data, stderr_data, returncode = await asyncio.to_thread(
+            _run_subprocess, full_task, thread_id
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("[brain] timeout after 600s for thread %s", thread_id)
+        return ("❌ 执行超时（10分钟），请稍后重试", None)
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
-        return f"❌ 执行出错: {e}"
+        return (f"❌ 执行出错: {e}", None)
+
+    stderr = (stderr_data or "").strip()
+    stdout, tool_call_count = _parse_stream_output(stdout_data)
+
+    # Parse usage from stream
+    usage = parse_usage_from_stream(stdout_data)
+
+    logger.info("[brain] claude rc=%d tool_calls=%d stdout_len=%d",
+                returncode, tool_call_count, len(stdout))
+
+    if returncode != 0:
+        err = stderr[:500] if stderr else stdout[:500] or "(no output)"
+        logger.error("[brain] claude error rc=%d: %s", returncode, err)
+        return (f"❌ 执行出错: {err}", None)
+
+    # --- Update working memory (non-watchdog, on success) ---
+    if not is_watchdog and stdout:
+        with _memory_lock:
+            working_memory[thread_id].append((task, stdout))
+        if usage:
+            last_usage[thread_id] = usage
+
+    return (stdout or "(empty response)", usage)
 
 
-def run_agent_sync(task: str, chat_id: int | None = None,
-                   thread_id: str = "watchdog", quiet: bool = False) -> str:
-    return run_agent(task, chat_id=None if quiet else chat_id, thread_id=thread_id)
+# ---------------------------------------------------------------------------
+# Sync wrapper for watchdog (runs in a background thread, not async context)
+# ---------------------------------------------------------------------------
+
+def run_agent_sync(
+    task: str,
+    chat_id: int | None = None,
+    thread_id: str = "watchdog",
+    quiet: bool = False,
+) -> str:
+    """Synchronous wrapper around run_agent() for use in watchdog threads."""
+    effective_chat_id = None if quiet else chat_id
+    result_text, _usage = asyncio.run(
+        run_agent(task, chat_id=effective_chat_id, thread_id=thread_id)
+    )
+    return result_text

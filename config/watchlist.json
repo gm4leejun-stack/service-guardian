@@ -1,0 +1,21 @@
+{
+  "services": [
+    {
+      "key": "openclaw",
+      "label": "ai.openclaw.gateway",
+      "description": "OpenClaw Gateway",
+      "log": "~/.openclaw/logs/gateway.log",
+      "freeze_check": "process_down",
+      "runbook": "docs/runbooks/openclaw.md"
+    },
+    {
+      "key": "nanoclaw",
+      "label": "com.nanoclaw",
+      "description": "NanoClaw",
+      "log": "~/nanoclaw/logs/nanoclaw.log",
+      "freeze_check": "process_down",
+      "bot_token_env": "NANOCLAW_BOT_TOKEN",
+      "runbook": "docs/runbooks/nanoclaw.md"
+    }
+  ]
+}

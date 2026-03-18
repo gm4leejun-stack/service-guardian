@@ -47,12 +47,8 @@ SHELL_BLOCKED_PATTERNS = [
 
 # Watchdog
 WATCHDOG_CHECK_INTERVAL = 60  # seconds
-WATCHDOG_FREEZE_THRESHOLD = 120  # seconds of no log activity = frozen
 WATCHDOG_QUIET_HOURS_START = 0   # 0:00
 WATCHDOG_QUIET_HOURS_END = 8     # 8:00
-
-# LangGraph
-LANGGRAPH_RECURSION_LIMIT = 100
 
 # Mac Exec Bridge (lets NanoClaw containers run Mac commands via host.docker.internal)
 EXEC_BRIDGE_PORT = int(os.environ.get("EXEC_BRIDGE_PORT", "18800"))

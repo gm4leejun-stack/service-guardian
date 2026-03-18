@@ -1,7 +1,7 @@
 """
-bot/telegram_bot.py — Telegram bot for AI Supervisor.
+bot/telegram_bot.py — Telegram bot for AI Supervisor (v2/v3 architecture).
 
-Routes all messages through the LangGraph ReAct Agent (brain.py).
+Routes all messages through brain.py, which runs claude --print as a subprocess.
 The bot instance and event loop are injected into notify_tools
 so the Agent can send real-time progress updates.
 """
@@ -30,6 +30,7 @@ from telegram.ext import (
 from config.settings import TELEGRAM_BOT_TOKEN, ALLOWED_USERS
 import tools.notify_tools as notify_tools  # needs setup() called at startup
 from agent.brain import run_agent
+import agent.brain as brain
 from tools.system_tools import _system_status_impl
 from tools.nanoclaw_tools import nanoclaw_manage_mount, nanoclaw_register_group
 from tools.service_tools import restart_service_tool, check_service
@@ -37,6 +38,23 @@ from tools.service_tools import restart_service_tool, check_service
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LEN = 4096
+
+
+def format_token_stats(usage: dict) -> str:
+    """格式化 token 统计行，追加到消息末尾"""
+    if not usage:
+        return ""
+    input_total = (
+        usage.get("input_tokens", 0)
+        + usage.get("cache_creation_input_tokens", 0)
+        + usage.get("cache_read_input_tokens", 0)
+    )
+    output = usage.get("output_tokens", 0)
+
+    def fmt(n: int) -> str:
+        return f"{n/1000:.1f}K" if n >= 1000 else str(n)
+
+    return f"\n\n[⬆️ {fmt(input_total)}  ⬇️ {fmt(output)}]"
 
 
 def _check_allowed(update: Update) -> bool:
@@ -89,19 +107,15 @@ async def _run_agent_and_reply(update: Update, task: str) -> None:
         logger.warning("Could not send thinking indicator: %s", e)
 
     try:
-        # Run agent in thread pool (it's blocking).
-        # asyncio.wait_for ensures the event loop unblocks even if the thread hangs
-        # (brain.py has its own 600s subprocess timeout; this is a belt-and-suspenders).
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: run_agent(task, chat_id=chat_id, thread_id=str(chat_id))
-            ),
+        # run_agent is async; asyncio.wait_for is a belt-and-suspenders guard
+        # (brain.py has its own 600s subprocess timeout via asyncio.to_thread).
+        result_text, usage = await asyncio.wait_for(
+            run_agent(task, chat_id=chat_id, thread_id=str(chat_id)),
             timeout=720,  # 12 min > brain's 10 min subprocess timeout
         )
-        if result:
-            await send_reply(update, result)
+        if result_text:
+            stats = format_token_stats(usage)
+            await send_reply(update, result_text + stats)
     except asyncio.TimeoutError:
         logger.error("Executor timeout (720s) for chat %s task: %s", chat_id, task[:60])
         try:
@@ -158,6 +172,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/run `<命令>` — 执行 Shell 命令\n"
         "/claude `<任务>` — 调用 Claude Code\n"
         "/scaffold `<路径>` `<repo_url>` — 克隆项目并安装依赖\n\n"
+        "*上下文 & Token*\n"
+        "/new — 清空当前对话上下文，开始新任务\n"
+        "/input — 查看上次调用的 Token 用量分析\n\n"
         "*NanoClaw 管理*\n"
         "/nano groups — 列出所有群组（零延迟）\n"
         "/nano mount add `<路径>` `<jid>` [container_path] — 添加挂载\n"
@@ -241,7 +258,7 @@ async def cmd_sysinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Zero-LLM fast path: psutil + service status, no Haiku call."""
     if not _check_allowed(update):
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _system_status_impl)
     await send_reply(update, result)
 
@@ -277,7 +294,7 @@ async def _nano_mount_direct(
     """Zero-LLM direct execution path for mount operations.
     Pattern: call tool → restart → verify → reply. No Agent involved.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     mount_result = await loop.run_in_executor(
         None, lambda: nanoclaw_manage_mount.invoke({
@@ -304,7 +321,7 @@ async def _nano_register_direct(
     """Zero-LLM direct execution path for group registration.
     Pattern: call tool → restart → verify → reply. No Agent involved.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     reg_result = await loop.run_in_executor(
         None, lambda: nanoclaw_register_group.invoke({
@@ -376,6 +393,56 @@ async def cmd_nano(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"未知子命令: {sub}。可选: groups, mount, register")
 
 
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear current working memory and start a new task context."""
+    if not _check_allowed(update):
+        return
+    thread_id = str(update.effective_chat.id)
+    with brain._memory_lock:
+        history = list(brain.working_memory.get(thread_id, []))
+    if history:
+        summary = await brain.generate_summary_with_haiku(thread_id)
+        try:
+            brain.save_long_term_memory(thread_id, summary)
+        except Exception as e:
+            logger.warning("Failed to save long-term memory: %s", e)
+            # Continue with clearing working memory even if save fails
+        with brain._memory_lock:
+            brain.working_memory[thread_id] = []
+            brain.last_usage.pop(thread_id, None)
+        await update.message.reply_text("✅ 上下文已清除，开始新任务")
+    else:
+        await update.message.reply_text("📭 当前无活跃上下文。")
+
+
+async def cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show token usage breakdown for the last agent call in this thread."""
+    if not _check_allowed(update):
+        return
+    thread_id = str(update.effective_chat.id)
+    usage_record = brain.last_usage.get(thread_id)
+    if not usage_record:
+        await update.message.reply_text("暂无记录，请先发送一条消息。")
+        return
+
+    input_tokens = usage_record.get("input_tokens", 0)
+    cache_create = usage_record.get("cache_creation_input_tokens", 0)
+    cache_read = usage_record.get("cache_read_input_tokens", 0)
+    output_tokens = usage_record.get("output_tokens", 0)
+    input_total = input_tokens + cache_create + cache_read
+
+    lines = [
+        "📊 上次 Token 用量分析",
+        "",
+        f"输入合计：{input_total:,}",
+        f"  ├ 直接输入：{input_tokens:,}",
+        f"  ├ 缓存创建：{cache_create:,}",
+        f"  └ 缓存命中：{cache_read:,}",
+        f"输出：{output_tokens:,}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_scaffold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_allowed(update):
         return
@@ -398,6 +465,8 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     text = (update.message.text or "").strip()
     if not text:
+        return
+    if text.startswith("Stop hook feedback:"):
         return
     logger.info("Message from %s: %s", update.effective_user.id, text[:80])
     await _run_agent_and_reply(update, text)
@@ -436,13 +505,15 @@ def main() -> None:
     app.add_handler(CommandHandler("sysinfo", cmd_sysinfo))
     app.add_handler(CommandHandler("nano", cmd_nano))
     app.add_handler(CommandHandler("scaffold", cmd_scaffold))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("input", cmd_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_error_handler(error_handler)
 
     # Inject bot instance into notify_tools after the app is built
     # We do this via post_init so the bot and loop are both ready
     async def post_init(application: Application) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         notify_tools.setup(application.bot, loop)
         logger.info("Bot instance injected into notify_tools")
 
@@ -467,6 +538,8 @@ def main() -> None:
             BotCommand("claude",   "调用 Claude Code"),
             BotCommand("scaffold", "克隆项目：scaffold <路径> <repo_url>"),
             BotCommand("nano",     "NanoClaw 管理：nano <groups|mount|register>"),
+            BotCommand("new",      "清空当前对话上下文，开始新任务"),
+            BotCommand("input",    "查看上次调用的 Token 用量分析"),
             BotCommand("help",     "查看所有命令"),
             BotCommand("start",    "启动 bot"),
         ])

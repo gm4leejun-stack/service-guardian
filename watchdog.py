@@ -18,6 +18,7 @@ Quiet hours (0:00–8:00): rescues run silently, no Telegram notifications.
 """
 from __future__ import annotations
 
+import os
 import time
 import json
 import logging
@@ -30,23 +31,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config.settings import (
     WATCHDOG_CHECK_INTERVAL,
-    WATCHDOG_FREEZE_THRESHOLD,
     WATCHDOG_QUIET_HOURS_START,
     WATCHDOG_QUIET_HOURS_END,
-    OPENCLAW_LOG,
     ADMIN_CHAT_ID,
     ANTHROPIC_API_KEY,
     ANTHROPIC_BASE_URL,
     CLAUDE_MODEL,
     HAIKU_MODEL,
 )
+import config.settings as settings
 from tools.service_tools import get_service_status, restart_service
 
 logger = logging.getLogger(__name__)
-
-# Telegram bot tokens (for pending update check)
-OPENCLAW_BOT_TOKEN = "8397885859:AAHwmhMbyUu8cRcG_vdIkb-PG7TUGMt21xU"
-NANOCLAW_BOT_TOKEN = "8328203583:AAGMjtJKTihd7acVkpYACK6mxBp7o6ldkJY"
 
 # Bot heartbeat file written by telegram_bot.py every 30s
 BOT_HEARTBEAT_FILE = str(Path(__file__).parent / "logs" / "bot_heartbeat.txt")
@@ -56,25 +52,23 @@ BOT_HEARTBEAT_THRESHOLD = 300  # 5 minutes — bot polling thread is dead
 RESCUE_COOLDOWN = 3600
 _last_rescue: dict[str, float] = {}
 
-SERVICES_TO_WATCH = [
-    {
-        "key": "openclaw",
-        "log": OPENCLAW_LOG,
-        "description": "OpenClaw Gateway",
-        # OpenClaw only writes logs during activity; idle silence (30min health-monitor cycles)
-        # is normal. Freeze detection: process must be DOWN (not log-stale).
-        "freeze_check": "process_down",
-    },
-    {
-        "key": "nanoclaw",
-        "log": str(Path.home() / "nanoclaw/logs/nanoclaw.log"),
-        "description": "NanoClaw",
-        # NanoClaw only writes logs when handling messages; idle silence is normal.
-        # Freeze detection: process must be DOWN (not log-stale).
-        "freeze_check": "process_down",
-        "bot_token": NANOCLAW_BOT_TOKEN,
-    },
-]
+def _load_watchlist() -> list[dict]:
+    """每次调用重新读取，支持热更新"""
+    path = Path(__file__).parent / "config" / "watchlist.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        services = data["services"]
+    except FileNotFoundError:
+        logger.error("watchlist.json not found at %s", path)
+        return []
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error("watchlist.json parse error: %s", e)
+        return []
+    for svc in services:
+        if "log" in svc:
+            svc["log"] = os.path.expanduser(svc["log"])
+    return services
 
 
 def is_quiet_hours() -> bool:
@@ -104,6 +98,16 @@ def _log_age_seconds(log_path: str) -> float | None:
     return time.time() - p.stat().st_mtime
 
 
+def _get_bot_token(svc: dict) -> str:
+    """Per-service bot token resolution.
+    Prepared for future log_stale / pending-count check modes.
+    Currently process_down mode does not use per-service tokens.
+    """
+    token_env = svc.get("bot_token_env")
+    bot_token = os.environ.get(token_env) if token_env else settings.TELEGRAM_BOT_TOKEN
+    return bot_token or settings.TELEGRAM_BOT_TOKEN
+
+
 def _get_telegram_pending(bot_token: str) -> int | None:
     try:
         url = f"https://api.telegram.org/bot{bot_token}/getWebhookInfo"
@@ -117,7 +121,6 @@ def _get_telegram_pending(bot_token: str) -> int | None:
 
 def check_service_health(service_config: dict) -> dict:
     key = service_config["key"]
-    log_path = service_config["log"]
     desc = service_config["description"]
     freeze_check = service_config.get("freeze_check", "process_down")
 
@@ -132,36 +135,22 @@ def check_service_health(service_config: dict) -> dict:
             "message": f"{desc} 进程已停止，需要重启",
         }
 
+    log_path = service_config.get("log", "")
+
     # process_down mode: only flag if process is not running (log silence is normal)
     if freeze_check == "process_down":
-        age = _log_age_seconds(log_path)
+        age = _log_age_seconds(log_path) if log_path else None
         msg = (f"{desc} 健康（进程存活，日志更新于 {age:.0f}s 前）"
                if age is not None else f"{desc} 健康（进程存活）")
         logger.debug("[watchdog] %s", msg)
         return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
 
-    age = _log_age_seconds(log_path)
-    if age is None or age <= WATCHDOG_FREEZE_THRESHOLD:
-        msg = (f"{desc} 健康（日志更新于 {age:.0f}s 前）"
-               if age is not None else f"{desc} 运行中（日志不存在）")
-        logger.debug("[watchdog] %s", msg)
-        return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
-
-    # Log is stale — treat as frozen regardless of Telegram pending count.
-    # Rationale: a stale socket means Telegram never delivers messages,
-    # so pending stays 0 even though the service is actually broken.
-    # We still fetch pending for the triage context message, but it no
-    # longer gates whether we trigger a rescue.
-    bot_token = service_config.get("bot_token", OPENCLAW_BOT_TOKEN)
-    pending = _get_telegram_pending(bot_token)
-    pending_info = f"Telegram 积压 {pending} 条" if pending else "Telegram 积压 0 条（可能是 stale socket）"
-
-    logger.warning("[watchdog] %s FROZEN: log stale %.0fs (%s)",
-                   desc, age, pending_info)
-    return {
-        "service": key, "running": True, "frozen": True, "log_age": age,
-        "message": f"{desc} 冻结（日志 {age:.0f}s 未更新，{pending_info}）",
-    }
+    # Fallback for any future freeze_check modes not yet implemented
+    age = _log_age_seconds(log_path) if log_path else None
+    msg = (f"{desc} 健康（日志更新于 {age:.0f}s 前）"
+           if age is not None else f"{desc} 运行中（日志不存在）")
+    logger.debug("[watchdog] %s", msg)
+    return {"service": key, "running": True, "frozen": False, "log_age": age, "message": msg}
 
 
 def _smart_triage(service_key: str, description: str, anomaly_summary: str) -> bool:
@@ -265,7 +254,8 @@ def _restart_self() -> None:
 
 def run_watchdog_once() -> list[dict]:
     results = []
-    for svc in SERVICES_TO_WATCH:
+    services = _load_watchlist()
+    for svc in services:
         try:
             r = check_service_health(svc)
             results.append(r)
@@ -298,8 +288,8 @@ def run_watchdog_once() -> list[dict]:
 
 def run_watchdog_loop() -> None:
     logger.info(
-        "[watchdog] Starting loop (interval=%ds, freeze_threshold=%ds, cooldown=%ds, quiet=%s-%s)",
-        WATCHDOG_CHECK_INTERVAL, WATCHDOG_FREEZE_THRESHOLD, RESCUE_COOLDOWN,
+        "[watchdog] Starting loop (interval=%ds, cooldown=%ds, quiet=%s-%s)",
+        WATCHDOG_CHECK_INTERVAL, RESCUE_COOLDOWN,
         f"{WATCHDOG_QUIET_HOURS_START:02d}:00", f"{WATCHDOG_QUIET_HOURS_END:02d}:00",
     )
     while True:
