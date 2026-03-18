@@ -431,14 +431,17 @@ async def cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     output_tokens = usage_record.get("output_tokens", 0)
     input_total = input_tokens + cache_create + cache_read
 
+    def _fmt(n: int) -> str:
+        return f"{n/1000:.1f}K" if n >= 1000 else str(n)
+
     lines = [
         "📊 上次 Token 用量分析",
         "",
-        f"输入合计：{input_total:,}",
-        f"  ├ 直接输入：{input_tokens:,}",
-        f"  ├ 缓存创建：{cache_create:,}",
-        f"  └ 缓存命中：{cache_read:,}",
-        f"输出：{output_tokens:,}",
+        f"输入合计：{_fmt(input_total)}",
+        f"  ├ 直接输入：{_fmt(input_tokens)}",
+        f"  ├ 缓存创建：{_fmt(cache_create)}",
+        f"  └ 缓存命中：{_fmt(cache_read)}",
+        f"输出：{_fmt(output_tokens)}",
     ]
     await update.message.reply_text("\n".join(lines))
 
