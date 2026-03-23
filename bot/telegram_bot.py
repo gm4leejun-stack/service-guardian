@@ -175,6 +175,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*上下文 & Token*\n"
         "/new — 清空当前对话上下文，开始新任务\n"
         "/input — 查看上次调用的 Token 用量分析\n\n"
+        "*经验库*\n"
+        "/remember `<内容>` — 手动录入经验到知识库\n"
+        "/knowledge — 查看最近 10 条经验\n"
+        "/knowledge delete `<id>` — 删除指定经验条目\n\n"
         "*NanoClaw 管理*\n"
         "/nano groups — 列出所有群组（零延迟）\n"
         "/nano mount add `<路径>` `<jid>` [container_path] — 添加挂载\n"
@@ -478,6 +482,38 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/remember <text> — 手动录入经验到知识库。"""
+    from agent import knowledge as _knowledge
+
+    if not _check_allowed(update):
+        return
+
+    text = (update.message.text or "").removeprefix("/remember").strip()
+    if not text:
+        await update.message.reply_text(
+            "用法：/remember <经验内容>\n"
+            "例：/remember OpenClaw升级后需要执行 openclaw config set tools.profile full 才能调用工具"
+        )
+        return
+
+    await update.message.reply_text("⏳ 正在整理经验...")
+
+    entry = await _knowledge.extract_knowledge_from_text(text)
+    if entry is None:
+        await update.message.reply_text("❌ 无法从内容中提取有效经验，请提供更具体的问题和解法。")
+        return
+
+    await _knowledge.push_entry_async(entry)
+    reply = (
+        f"✅ 经验已记录\n"
+        f"🏷️ 标签：{', '.join(entry['tags'])}\n"
+        f"🔍 根因：{entry['root_cause']}\n"
+        f"💡 解法：{entry['solution'][:100]}{'...' if len(entry['solution']) > 100 else ''}"
+    )
+    await update.message.reply_text(reply)
+
+
 async def cmd_scaffold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_allowed(update):
         return
@@ -543,6 +579,7 @@ def main() -> None:
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("input", cmd_input))
     app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("remember", cmd_remember))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_error_handler(error_handler)
 
@@ -577,6 +614,8 @@ def main() -> None:
             BotCommand("new",      "清空当前对话上下文，开始新任务"),
             BotCommand("input",    "查看上次调用的 Token 用量分析"),
             BotCommand("myid",     "查看你的 chat_id（初次配置用）"),
+            BotCommand("remember", "手动录入经验到知识库"),
+            BotCommand("knowledge","查看/管理经验库"),
             BotCommand("help",     "查看所有命令"),
             BotCommand("start",    "启动 bot"),
         ])
