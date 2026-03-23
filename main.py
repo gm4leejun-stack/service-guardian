@@ -76,6 +76,14 @@ def main() -> None:
     from tools.exec_bridge import start_bridge
     start_bridge(EXEC_BRIDGE_PORT, EXEC_BRIDGE_TOKEN)
 
+    # Sync knowledge base from GitHub on startup (non-blocking failure)
+    try:
+        from agent.knowledge import sync_from_github
+        sync_from_github()
+        logger.info("Knowledge base synced from GitHub")
+    except Exception as e:
+        logger.warning("Knowledge sync skipped: %s", e)
+
     logger.info("Starting Telegram bot (Agent mode)")
     run_bot()
 

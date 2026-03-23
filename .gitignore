@@ -13,3 +13,5 @@ dist/
 build/
 agent/memory.json
 agent/sessions.json
+agent/knowledge_cache.json
+agent/knowledge_pending.json

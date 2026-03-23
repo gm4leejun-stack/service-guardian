@@ -80,6 +80,13 @@ if [ ! -f "$ENV_FILE" ]; then
     echo "   Example: Mac mini, MacBook Pro"
     read -p "   Name [skip]: " MACHINE_NAME
 
+    # Optional: GitHub token for cross-machine knowledge sync
+    echo ""
+    echo "📚 经验库跨机器同步（可选）"
+    echo "   需要 GitHub Personal Access Token（repo 权限）才能启用跨机器知识同步"
+    echo "   不配置则本机正常使用，只是经验不会同步到其他机器"
+    read -p "   GitHub Token [skip]: " GITHUB_TOKEN
+
     # Auto-generate EXEC_BRIDGE_TOKEN
     BRIDGE_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 
@@ -92,6 +99,7 @@ CLAUDE_MODEL=claude-sonnet-4-6
 ADMIN_CHAT_ID=
 MACHINE_NAME=$MACHINE_NAME
 GITHUB_REPO=
+GITHUB_TOKEN=$GITHUB_TOKEN
 EXEC_BRIDGE_TOKEN=$BRIDGE_TOKEN
 EXEC_BRIDGE_PORT=18800
 EOF
