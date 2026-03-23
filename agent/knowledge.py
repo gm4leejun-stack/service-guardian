@@ -148,3 +148,138 @@ def format_search_summary_for_user(results: list[dict]) -> str:
     top = results[0]
     summary = top.get("root_cause", "")[:40]
     return f"📚 参考了 {len(results)} 条历史经验（{summary}）\n"
+
+
+# ---------------------------------------------------------------------------
+# Haiku extraction
+# ---------------------------------------------------------------------------
+
+_EXTRACT_PROMPT = """你是知识库整理专家。分析以下对话历史，判断是否有值得保存的问题解决经验。
+
+判断标准（满足任一即保存）：
+- 根因不显而易见（不是简单"重启"）
+- 涉及版本变更、配置变化、特定软件行为
+- 用户提供了外部文档或特殊解决方案
+
+只记录最终被用户确认有效的解法，排除所有失败尝试。
+去除路径中的用户名、IP地址、凭据，但保留命令、版本号、配置键名。
+
+返回严格的 JSON（无其他文字）：
+{{
+  "worth_saving": true/false,
+  "tags": ["关键词1", "关键词2"],
+  "affected_versions": [],
+  "symptoms": ["现象1", "现象2"],
+  "root_cause": "一句话根本原因",
+  "solution": "完整可执行的解决方案，含具体命令"
+}}
+
+对话历史：
+{conversation}"""
+
+
+def _parse_haiku_json(raw: str) -> dict | None:
+    """Parse Haiku JSON output. Returns None if not worth saving or parse error."""
+    import re
+    raw = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not data.get("worth_saving"):
+        return None
+    required = {"tags", "symptoms", "root_cause", "solution"}
+    if not required.issubset(data.keys()):
+        return None
+    return data
+
+
+async def extract_knowledge_from_conversation(
+    history: list[tuple[str, str]],
+) -> dict | None:
+    """Use Haiku to extract a knowledge entry from conversation history."""
+    import anthropic as _anthropic
+    if not history:
+        return None
+
+    lines = []
+    for user_msg, assistant_resp in history[-10:]:
+        lines.append(f"用户: {user_msg[:300]}")
+        lines.append(f"助手: {assistant_resp[:500]}")
+    conversation = "\n".join(lines)
+
+    prompt = _EXTRACT_PROMPT.format(conversation=conversation)
+
+    client = _anthropic.AsyncAnthropic(
+        api_key=settings.ANTHROPIC_API_KEY,
+        base_url=settings.ANTHROPIC_BASE_URL,
+    )
+    try:
+        msg = await client.messages.create(
+            model=settings.HAIKU_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+    except Exception as e:
+        logger.warning("Haiku knowledge extraction failed: %s", e)
+        return None
+
+    parsed = _parse_haiku_json(raw)
+    if parsed is None:
+        return None
+
+    return make_entry(
+        tags=parsed.get("tags", []),
+        symptoms=parsed.get("symptoms", []),
+        root_cause=parsed["root_cause"],
+        solution=parsed["solution"],
+        source="auto",
+        affected_versions=parsed.get("affected_versions", []),
+    )
+
+
+async def extract_knowledge_from_text(raw_text: str) -> dict | None:
+    """Use Haiku to structure user-provided text into a knowledge entry (/remember path)."""
+    import anthropic as _anthropic
+
+    prompt = f"""将以下内容整理为结构化知识条目。返回严格 JSON（无其他文字）：
+{{
+  "worth_saving": true,
+  "tags": ["关键词1", "关键词2"],
+  "affected_versions": [],
+  "symptoms": ["现象描述"],
+  "root_cause": "根本原因",
+  "solution": "解决方案（含具体命令）"
+}}
+
+内容：
+{raw_text[:1000]}"""
+
+    client = _anthropic.AsyncAnthropic(
+        api_key=settings.ANTHROPIC_API_KEY,
+        base_url=settings.ANTHROPIC_BASE_URL,
+    )
+    try:
+        msg = await client.messages.create(
+            model=settings.HAIKU_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+    except Exception as e:
+        logger.warning("Haiku manual knowledge extraction failed: %s", e)
+        return None
+
+    parsed = _parse_haiku_json(raw)
+    if parsed is None:
+        return None
+
+    return make_entry(
+        tags=parsed.get("tags", []),
+        symptoms=parsed.get("symptoms", []),
+        root_cause=parsed["root_cause"],
+        solution=parsed["solution"],
+        source="manual",
+        affected_versions=parsed.get("affected_versions", []),
+    )

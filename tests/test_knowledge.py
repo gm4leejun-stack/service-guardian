@@ -78,3 +78,28 @@ def test_extract_keywords():
     kws = k.extract_keywords("OpenClaw升级后Bot拒绝调用工具permission denied")
     assert "OpenClaw" in kws or "openclaw" in kws.lower() if isinstance(kws, str) else any("openclaw" in w.lower() for w in kws)
     assert any("拒绝" in w or "permission" in w.lower() for w in kws)
+
+
+def test_parse_haiku_knowledge_valid():
+    """_parse_haiku_json returns structured entry from valid Haiku output."""
+    import agent.knowledge as k
+    raw = json.dumps({
+        "worth_saving": True,
+        "tags": ["openclaw", "permission"],
+        "affected_versions": ["2026.3.x"],
+        "symptoms": ["Bot拒绝调用工具"],
+        "root_cause": "权限策略收紧",
+        "solution": "openclaw config set tools.profile full && openclaw gateway restart",
+    })
+    result = k._parse_haiku_json(raw)
+    assert result is not None
+    assert result["root_cause"] == "权限策略收紧"
+    assert result["tags"] == ["openclaw", "permission"]
+
+
+def test_parse_haiku_knowledge_not_worth_saving():
+    """_parse_haiku_json returns None when worth_saving is False."""
+    import agent.knowledge as k
+    raw = json.dumps({"worth_saving": False})
+    result = k._parse_haiku_json(raw)
+    assert result is None
