@@ -283,3 +283,159 @@ async def extract_knowledge_from_text(raw_text: str) -> dict | None:
         source="manual",
         affected_versions=parsed.get("affected_versions", []),
     )
+
+
+# ---------------------------------------------------------------------------
+# GitHub API sync
+# ---------------------------------------------------------------------------
+
+_GITHUB_BRANCH = "knowledge"
+_GITHUB_FILE = "knowledge_base.json"
+
+
+def _parse_github_coords() -> tuple[str, str] | None:
+    """Extract (owner, repo) from settings.GITHUB_REPO URL. Returns None if not configured."""
+    import re
+    url = settings.GITHUB_REPO or ""
+    m = re.search(r"github\.com[/:]([^/]+)/([^/.\s]+)", url)
+    if not m:
+        return None
+    return m.group(1), m.group(2).removesuffix(".git")
+
+
+def _github_headers() -> dict:
+    return {
+        "Authorization": f"token {settings.GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+
+def sync_from_github() -> None:
+    """Fetch knowledge_base.json from GitHub knowledge branch, merge into local cache."""
+    if not settings.GITHUB_TOKEN or not settings.GITHUB_REPO:
+        return
+    coords = _parse_github_coords()
+    if not coords:
+        return
+    owner, repo = coords
+
+    import base64
+    import requests as req
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{_GITHUB_FILE}"
+    try:
+        resp = req.get(url, headers=_github_headers(), params={"ref": _GITHUB_BRANCH}, timeout=10)
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+        content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+        remote_entries: list[dict] = json.loads(content)
+    except Exception as e:
+        logger.warning("sync_from_github failed: %s", e)
+        return
+
+    with _lock:
+        local = load_knowledge_cache()
+        local_ids = {e.get("id") for e in local}
+        new_entries = [e for e in remote_entries if e.get("id") not in local_ids]
+        if new_entries:
+            _save_knowledge_cache(local + new_entries)
+            logger.info("sync_from_github: merged %d new entries", len(new_entries))
+
+
+def _push_to_github_sync(entries: list[dict]) -> bool:
+    """Push full entries list to GitHub knowledge branch. Returns True on success."""
+    coords = _parse_github_coords()
+    if not coords:
+        return False
+    owner, repo = coords
+
+    import base64
+    import requests as req
+
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{_GITHUB_FILE}"
+
+    for attempt in range(3):
+        try:
+            get_resp = req.get(api_url, headers=_github_headers(), params={"ref": _GITHUB_BRANCH}, timeout=10)
+            sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+            content_b64 = base64.b64encode(
+                json.dumps(entries, ensure_ascii=False, indent=2).encode("utf-8")
+            ).decode("ascii")
+
+            body: dict = {
+                "message": "data(knowledge): +1 entry",
+                "content": content_b64,
+                "branch": _GITHUB_BRANCH,
+            }
+            if sha:
+                body["sha"] = sha
+
+            put_resp = req.put(api_url, headers=_github_headers(), json=body, timeout=15)
+            if put_resp.status_code in (200, 201):
+                return True
+            if put_resp.status_code == 409:
+                logger.info("GitHub push 409 conflict, retrying (attempt %d)", attempt + 1)
+                continue
+            logger.warning("GitHub push failed: %s %s", put_resp.status_code, put_resp.text[:200])
+            return False
+        except Exception as e:
+            logger.warning("GitHub push error (attempt %d): %s", attempt + 1, e)
+
+    return False
+
+
+def _add_to_pending(entry: dict) -> None:
+    """Add entry to pending sync queue."""
+    with _lock:
+        try:
+            pending = json.loads(KNOWLEDGE_PENDING_PATH.read_text(encoding="utf-8")) if KNOWLEDGE_PENDING_PATH.exists() else []
+        except (json.JSONDecodeError, OSError):
+            pending = []
+        pending.append(entry)
+        KNOWLEDGE_PENDING_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _flush_pending() -> None:
+    """Try to push any pending entries to GitHub."""
+    if not KNOWLEDGE_PENDING_PATH.exists():
+        return
+    try:
+        pending = json.loads(KNOWLEDGE_PENDING_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not pending:
+        return
+
+    with _lock:
+        local = load_knowledge_cache()
+        local_ids = {e.get("id") for e in local}
+        for e in pending:
+            if e.get("id") not in local_ids:
+                local.append(e)
+        _save_knowledge_cache(local)
+
+    if _push_to_github_sync(local):
+        KNOWLEDGE_PENDING_PATH.unlink(missing_ok=True)
+        logger.info("Flushed %d pending knowledge entries to GitHub", len(pending))
+
+
+async def push_entry_async(entry: dict) -> None:
+    """Append entry to local cache and async-push to GitHub (non-blocking)."""
+    append_entry(entry)
+    if not settings.GITHUB_TOKEN or not settings.GITHUB_REPO:
+        return
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _push():
+        _flush_pending()
+        with _lock:
+            all_entries = load_knowledge_cache()
+        ok = _push_to_github_sync(all_entries)
+        if not ok:
+            _add_to_pending(entry)
+
+    loop.run_in_executor(None, _push)
