@@ -32,6 +32,7 @@ ALLOWED_USERS: list[int] = []
 # Machine identity (injected into agent system prompt at runtime)
 MACHINE_NAME = os.environ.get("MACHINE_NAME", "")          # e.g. "Mac mini"
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")            # e.g. "https://github.com/..."
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")          # optional; enables cross-machine knowledge sync
 
 # OpenClaw
 OPENCLAW_SERVICE = "ai.openclaw.gateway"
