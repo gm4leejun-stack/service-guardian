@@ -68,6 +68,26 @@ launchctl stop com.ai-supervisor && launchctl start com.ai-supervisor
 
 ---
 
+## 经验库
+
+龙虾医生会自动积累解决问题的经验，下次遇到类似问题时优先参考，越用越聪明。
+
+**自动提取：** 用户说"好了/解决了"且对话超过 3 轮时，Haiku 自动提取最终有效解法写入经验库。
+
+**手动录入：** 遇到版本升级说明、外部文档等，直接发给 Bot：
+```
+/remember OpenClaw升级到2026.3.x后需执行 openclaw config set tools.profile full 才能调用工具
+```
+
+**检索参考：** 每次新任务开始时自动检索，命中时回复开头会显示：
+```
+📚 参考了 1 条历史经验（OpenClaw权限策略变更）
+```
+
+**跨机同步：** 配置 `GITHUB_TOKEN` 后，经验通过 GitHub `knowledge` 分支在多台机器间共享。
+
+---
+
 ## NanoClaw 群接入 ai-supervisor
 
 新建 NanoClaw 群后，发给 **@jun_xiao_code_bot**：
@@ -87,10 +107,13 @@ ai-supervisor 会自动完成挂载 + 重启 NanoClaw。挂载后：
 | 变量 | 说明 |
 |------|------|
 | `TELEGRAM_BOT_TOKEN` | @BotFather 申请的 Bot Token |
-| `ANTHROPIC_API_KEY` | API Key |
+| `ANTHROPIC_API_KEY` | API Key（已安装 Claude Code 则可选）|
 | `ANTHROPIC_BASE_URL` | API 代理地址 |
 | `HAIKU_MODEL` | Watchdog Smart Triage 用的廉价模型 |
 | `ADMIN_CHAT_ID` | Watchdog 告警发送的 Telegram 用户 ID |
+| `MACHINE_NAME` | 机器名称，注入 Agent 上下文（可选）|
+| `GITHUB_REPO` | 项目 GitHub 地址（可选）|
+| `GITHUB_TOKEN` | GitHub Personal Access Token，用于经验库跨机同步（可选）|
 | `EXEC_BRIDGE_TOKEN` | Mac Exec Bridge 的认证 Token（NanoClaw 容器用）|
 | `EXEC_BRIDGE_PORT` | Mac Exec Bridge 端口，默认 18800 |
 
@@ -110,6 +133,11 @@ ai-supervisor 会自动完成挂载 + 重启 NanoClaw。挂载后：
 | `/nano mount add\|remove <路径> <JID>` | 管理挂载 |
 | `/nano register <JID> <name> <folder>` | 注册新群组 |
 | `/scaffold <路径> <repo_url>` | 克隆项目并安装依赖 |
+| `/remember <内容>` | 手动录入经验到知识库 |
+| `/knowledge` | 查看经验库（最近 10 条）|
+| `/knowledge delete <id>` | 删除指定经验条目 |
+| `/new` | 清空当前任务上下文 |
+| `/input` | 查看上次请求的 Token 用量明细 |
 
 也可以直接用中文描述，例如：
 - "OpenClaw 没回复了，帮我检查一下"
@@ -127,7 +155,8 @@ ai-supervisor/
 ├── CLAUDE.md                 # Claude Code 系统提示（执行规则）
 ├── config/settings.py        # 所有配置项
 ├── agent/
-│   └── brain.py              # claude --print 调用 + 对话历史
+│   ├── brain.py              # claude --print 调用 + 对话历史
+│   └── knowledge.py          # 经验库：本地 I/O + 检索 + Haiku 提取 + GitHub 同步
 ├── bot/
 │   └── telegram_bot.py       # Telegram Bot 处理器
 └── tools/
