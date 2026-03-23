@@ -30,6 +30,7 @@ from pathlib import Path
 import anthropic
 
 from config import settings
+from agent import knowledge as _knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ working_memory: dict[str, list[tuple[str, str]]] = defaultdict(list)
 
 # Token usage records per thread
 last_usage: dict[str, dict] = {}
+
+# Knowledge summary shown to user when a match is found (per thread)
+_knowledge_summary_cache: dict[str, str] = {}
 
 # Lock for working_memory and last_usage (accessed from threads and async context)
 _memory_lock = threading.Lock()
@@ -290,11 +294,11 @@ async def run_agent(
     task: str,
     chat_id: int | None = None,
     thread_id: str = "default",
-) -> tuple[str, dict | None]:
+) -> tuple[str, dict | None, str]:
     """Run the agent for a user task.
 
     Returns:
-        (response_text, usage_dict) — usage_dict may be None if not available.
+        (response_text, usage_dict, knowledge_summary) — usage_dict may be None if not available.
     """
     is_watchdog = thread_id.startswith("watchdog")
 
@@ -306,11 +310,22 @@ async def run_agent(
                 save_long_term_memory(thread_id, summary)
             except Exception as e:
                 logger.warning("Failed to save long-term memory: %s", e)
+        # --- Extract knowledge (non-blocking) ---
+        with _memory_lock:
+            history_snapshot = list(working_memory.get(thread_id, []))
+        if len(history_snapshot) >= 3:
+            async def _extract_and_push():
+                entry = await _knowledge.extract_knowledge_from_conversation(history_snapshot)
+                if entry:
+                    await _knowledge.push_entry_async(entry)
+                    logger.info("[brain] knowledge entry saved: %s", entry.get("root_cause", "")[:60])
+            asyncio.create_task(_extract_and_push())
+
         with _memory_lock:
             working_memory.pop(thread_id, None)
             last_usage.pop(thread_id, None)
         logger.info("[brain] Working memory cleared for thread %s", thread_id)
-        return ("✅ 上下文已清除，开始新任务", None)
+        return ("✅ 上下文已清除，开始新任务", None, "")
 
     # --- MAX_TASK_TURNS guard ---
     if not is_watchdog:
@@ -343,7 +358,18 @@ async def run_agent(
         env_lines.append(f"GitHub: {settings.GITHUB_REPO}")
     env_ctx = "[当前环境]\n" + "\n".join(env_lines) + "\n\n"
 
-    full_task = env_ctx + history_ctx + task + notify_hint
+    # --- Knowledge search (only for new tasks: empty working memory) ---
+    knowledge_ctx = ""
+    if not is_watchdog:
+        with _memory_lock:
+            is_new_task = len(working_memory.get(thread_id, [])) == 0
+        if is_new_task:
+            results = _knowledge.search_knowledge(task)
+            if results:
+                knowledge_ctx = _knowledge.format_search_result_for_prompt(results)
+                _knowledge_summary_cache[thread_id] = _knowledge.format_search_summary_for_user(results)
+
+    full_task = env_ctx + history_ctx + knowledge_ctx + task + notify_hint
 
     logger.info("[brain] task (chat=%s, thread=%s): %s", chat_id, thread_id, task[:80])
 
@@ -355,10 +381,10 @@ async def run_agent(
         )
     except subprocess.TimeoutExpired:
         logger.error("[brain] timeout after 600s for thread %s", thread_id)
-        return ("❌ 执行超时（10分钟），请稍后重试", None)
+        return ("❌ 执行超时（10分钟），请稍后重试", None, "")
     except Exception as e:
         logger.exception("[brain] unexpected error: %s", e)
-        return (f"❌ 执行出错: {e}", None)
+        return (f"❌ 执行出错: {e}", None, "")
     _elapsed = asyncio.get_event_loop().time() - _t0
 
     stderr = (stderr_data or "").strip()
@@ -374,7 +400,7 @@ async def run_agent(
     if returncode != 0:
         err = stderr[:500] if stderr else stdout[:500] or "(no output)"
         logger.error("[brain] claude error rc=%d: %s", returncode, err)
-        return (f"❌ 执行出错: {err}", None)
+        return (f"❌ 执行出错: {err}", None, "")
 
     # --- Update working memory (non-watchdog, on success) ---
     if not is_watchdog and stdout:
@@ -404,7 +430,8 @@ async def run_agent(
                 "_claude_md_chars": claude_md_chars,
             }
 
-    return (stdout or "(empty response)", usage)
+    knowledge_summary = _knowledge_summary_cache.pop(thread_id, "")
+    return (stdout or "(empty response)", usage, knowledge_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +446,7 @@ def run_agent_sync(
 ) -> str:
     """Synchronous wrapper around run_agent() for use in watchdog threads."""
     effective_chat_id = None if quiet else chat_id
-    result_text, _usage = asyncio.run(
+    result_text, _usage, _ks = asyncio.run(
         run_agent(task, chat_id=effective_chat_id, thread_id=thread_id)
     )
     return result_text
