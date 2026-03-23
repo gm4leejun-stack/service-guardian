@@ -109,13 +109,14 @@ async def _run_agent_and_reply(update: Update, task: str) -> None:
     try:
         # run_agent is async; asyncio.wait_for is a belt-and-suspenders guard
         # (brain.py has its own 600s subprocess timeout via asyncio.to_thread).
-        result_text, usage = await asyncio.wait_for(
+        result_text, usage, knowledge_summary = await asyncio.wait_for(
             run_agent(task, chat_id=chat_id, thread_id=str(chat_id)),
             timeout=720,  # 12 min > brain's 10 min subprocess timeout
         )
         if result_text:
             stats = format_token_stats(usage)
-            await send_reply(update, result_text + stats)
+            final_text = (knowledge_summary + result_text) if knowledge_summary else result_text
+            await send_reply(update, final_text + stats)
     except asyncio.TimeoutError:
         logger.error("Executor timeout (720s) for chat %s task: %s", chat_id, task[:60])
         try:
@@ -514,6 +515,40 @@ async def cmd_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(reply)
 
 
+async def cmd_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/knowledge — 列出最近10条经验；/knowledge delete <id> — 删除指定条目。"""
+    from agent import knowledge as _knowledge
+
+    if not _check_allowed(update):
+        return
+
+    args = context.args or []
+
+    if args and args[0] == "delete" and len(args) >= 2:
+        entry_id = args[1]
+        deleted = _knowledge.delete_entry(entry_id)
+        if deleted:
+            await update.message.reply_text(f"✅ 已删除经验 {entry_id}")
+        else:
+            await update.message.reply_text(f"❌ 未找到 id={entry_id} 的经验")
+        return
+
+    entries = _knowledge.load_knowledge_cache()
+    if not entries:
+        await update.message.reply_text("📚 经验库为空")
+        return
+
+    recent = entries[-10:]
+    lines = [f"📚 经验库（最近 {len(recent)} 条）\n"]
+    for e in reversed(recent):
+        lines.append(
+            f"• [{e.get('id', '?')}] {e.get('root_cause', '')[:50]}\n"
+            f"  标签：{', '.join(e.get('tags', []))}"
+        )
+    lines.append("\n删除：/knowledge delete <id>")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_scaffold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _check_allowed(update):
         return
@@ -580,6 +615,7 @@ def main() -> None:
     app.add_handler(CommandHandler("input", cmd_input))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("remember", cmd_remember))
+    app.add_handler(CommandHandler("knowledge", cmd_knowledge))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_error_handler(error_handler)
 
