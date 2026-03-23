@@ -82,3 +82,69 @@ def make_entry(
         "root_cause": root_cause,
         "solution": solution,
     }
+
+
+# ---------------------------------------------------------------------------
+# Keyword search
+# ---------------------------------------------------------------------------
+
+_STOPWORDS = {
+    '的', '了', '在', '是', '我', '你', '他', '她', '它', '和', '有', '这', '那', '也',
+    '后', '时', '被', '从', '到', '于', '把', '让', '对', '与', '但',
+    'the', 'a', 'an', 'is', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or',
+}
+
+
+def extract_keywords(query: str) -> list[str]:
+    """Extract meaningful tokens from a query (Chinese words + English alphanumeric)."""
+    import re
+    tokens = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z][a-zA-Z0-9._-]{1,}', query)
+    return [t for t in tokens if t.lower() not in _STOPWORDS]
+
+
+def search_knowledge(query: str, top_k: int = 3) -> list[dict]:
+    """Return top-k entries matching query keywords. Returns [] if none match."""
+    keywords = extract_keywords(query)
+    if not keywords:
+        return []
+
+    entries = load_knowledge_cache()
+    scored: list[tuple[int, dict]] = []
+
+    for entry in entries:
+        search_text = " ".join([
+            *entry.get("tags", []),
+            *entry.get("symptoms", []),
+            entry.get("root_cause", ""),
+            entry.get("solution", ""),
+        ]).lower()
+        score = sum(1 for kw in keywords if kw.lower() in search_text)
+        if score > 0:
+            scored.append((score, entry))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [e for _, e in scored[:top_k]]
+
+
+def format_search_result_for_prompt(results: list[dict]) -> str:
+    """Format search results for injection into claude subprocess prompt."""
+    if not results:
+        return ""
+    lines = ["[经验库参考]"]
+    for i, e in enumerate(results, 1):
+        lines.append(f"{i}. 症状：{'、'.join(e.get('symptoms', []))}")
+        lines.append(f"   根因：{e.get('root_cause', '')}")
+        lines.append(f"   解法：{e.get('solution', '')}")
+        if e.get("affected_versions"):
+            lines.append(f"   版本：{', '.join(e['affected_versions'])}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_search_summary_for_user(results: list[dict]) -> str:
+    """One-line summary for display to Telegram user."""
+    if not results:
+        return ""
+    top = results[0]
+    summary = top.get("root_cause", "")[:40]
+    return f"📚 参考了 {len(results)} 条历史经验（{summary}）\n"
